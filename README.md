@@ -165,6 +165,52 @@ bash =
 result.stdout  #=> "41\n"
 ```
 
+#### Reading and writing the virtual filesystem
+
+Custom commands access the filesystem through `JustBash.FS`. Reads return
+the (possibly updated) filesystem as the last element — thread it forward
+and return it on the struct, so backends that cache on read keep their
+caches. Errors are `%VFS.Error{}` structs; `JustBash.FS.strerror/1` turns
+one into the conventional message text.
+
+```elixir
+defmodule MyApp.Commands.Upcase do
+  @behaviour JustBash.Commands.Command
+
+  alias JustBash.FS
+
+  @impl true
+  def names, do: ["upcase"]
+
+  @impl true
+  def execute(bash, [path], _stdin) do
+    resolved = FS.resolve_path(bash.cwd, path)
+
+    case FS.read_file(bash.fs, resolved) do
+      {:ok, content, fs} ->
+        {:ok, fs} = FS.write_file(fs, resolved, String.upcase(content))
+        {%{stdout: "", stderr: "", exit_code: 0}, %{bash | fs: fs}}
+
+      {:error, %VFS.Error{} = err} ->
+        msg = "upcase: #{path}: #{FS.strerror(err)}\n"
+        {%{stdout: "", stderr: msg, exit_code: 1}, bash}
+    end
+  end
+
+  def execute(bash, _args, _stdin) do
+    {%{stdout: "", stderr: "upcase: expected 1 argument\n", exit_code: 1}, bash}
+  end
+end
+
+bash = JustBash.new(files: %{"/note.txt" => "hello"}, commands: %{"upcase" => MyApp.Commands.Upcase})
+{_result, bash} = JustBash.exec(bash, "upcase /note.txt")
+{result, _bash} = JustBash.exec(bash, "cat /note.txt")
+result.stdout  #=> "HELLO"
+```
+
+Upgrading a 0.3 command that used `JustBash.Fs.InMemoryFs`? See
+[UPGRADING.md](UPGRADING.md) for the full old→new mapping.
+
 Important caveats:
 
 - Custom commands run arbitrary Elixir code in the host BEAM process
@@ -360,6 +406,26 @@ When created without options, JustBash provides a Unix-like directory structure:
 - `/home/user` - Default working directory (and `$HOME`)
 - `/bin`, `/usr/bin` - Binary directories
 - `/tmp` - Temporary files
+
+## Virtual Filesystem and Mounts
+
+The filesystem is a [vfs](https://hexdocs.pm/vfs) mount table (`%VFS{}`) with
+JustBash's in-memory backend — symlinks, hard links, permissions — mounted at `/`.
+Any [`VFS.Mountable`](https://hexdocs.pm/vfs/VFS.Mountable.html) backend can be
+mounted alongside it, and every bash command sees it transparently:
+
+```elixir
+bash = JustBash.new()
+bash = JustBash.mount(bash, "/mnt", VFS.Memory.new(%{"/data.csv" => "a,b\n1,2\n"}))
+
+{result, bash} = JustBash.exec(bash, "cut -d, -f2 /mnt/data.csv")
+result.stdout  #=> "b\n2\n"
+```
+
+Mount resolution is longest-prefix. Backends that don't support an operation
+refuse it with a structured error — writing to a read-only mount fails with
+"Read-only file system", creating a symlink on a backend without symlinks fails
+with "Operation not supported" — and the script sees a normal nonzero exit code.
 
 ## API Reference
 

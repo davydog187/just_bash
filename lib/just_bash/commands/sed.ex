@@ -14,7 +14,7 @@ defmodule JustBash.Commands.Sed do
 
   alias JustBash.Commands.Command
   alias JustBash.Commands.Sed.{Executor, Parser}
-  alias JustBash.Fs.InMemoryFs
+  alias JustBash.FS
 
   @impl true
   def names, do: ["sed"]
@@ -168,13 +168,13 @@ defmodule JustBash.Commands.Sed do
 
   defp process_files_to_output(bash, files, commands, opts) do
     result =
-      Enum.reduce_while(files, {:ok, ""}, fn file, {:ok, acc} ->
-        resolved = InMemoryFs.resolve_path(bash.cwd, file)
+      Enum.reduce_while(files, {:ok, "", bash.fs}, fn file, {:ok, acc, fs} ->
+        resolved = FS.resolve_path(bash.cwd, file)
 
-        case InMemoryFs.read_file(bash.fs, resolved) do
-          {:ok, content} ->
+        case FS.read_file(fs, resolved) do
+          {:ok, content, fs} ->
             output = Executor.execute(content, commands, opts.silent)
-            {:cont, {:ok, acc <> output}}
+            {:cont, {:ok, acc <> output, fs}}
 
           {:error, _} ->
             {:halt, {:error, "sed: #{file}: No such file or directory\n"}}
@@ -182,7 +182,7 @@ defmodule JustBash.Commands.Sed do
       end)
 
     case result do
-      {:ok, output} -> {:ok, output, bash}
+      {:ok, output, fs} -> {:ok, output, %{bash | fs: fs}}
       {:error, msg} -> {:error, msg}
     end
   end
@@ -200,11 +200,11 @@ defmodule JustBash.Commands.Sed do
   end
 
   defp process_single_file_in_place(bash, file, commands, opts) do
-    resolved = InMemoryFs.resolve_path(bash.cwd, file)
+    resolved = FS.resolve_path(bash.cwd, file)
 
-    case InMemoryFs.read_file(bash.fs, resolved) do
-      {:ok, content} ->
-        write_processed_content(bash, resolved, file, content, commands, opts)
+    case FS.read_file(bash.fs, resolved) do
+      {:ok, content, fs} ->
+        write_processed_content(%{bash | fs: fs}, resolved, file, content, commands, opts)
 
       {:error, _} ->
         {:halt, {:error, "sed: #{file}: No such file or directory\n"}}
@@ -214,12 +214,23 @@ defmodule JustBash.Commands.Sed do
   defp write_processed_content(bash, resolved, file, content, commands, opts) do
     output = Executor.execute(content, commands, opts.silent)
 
-    case InMemoryFs.write_file(bash.fs, resolved, output) do
-      {:ok, new_fs} ->
-        {:cont, {:ok, %{bash | fs: new_fs}}}
+    with {:ok, fs} <- unlink_symlink_operand(bash.fs, resolved),
+         {:ok, new_fs} <- FS.write_file(fs, resolved, output) do
+      {:cont, {:ok, %{bash | fs: new_fs}}}
+    else
+      {:error, _} -> {:halt, {:error, "sed: #{file}: cannot write\n"}}
+    end
+  end
 
-      {:error, _} ->
-        {:halt, {:error, "sed: #{file}: cannot write\n"}}
+  # GNU sed -i renames a temp file over the operand, so a symlink
+  # operand is replaced by a regular file (the documented "breaks
+  # symbolic links" behavior) and the target is left untouched. Without
+  # this, FS.write_file would follow the link and edit the target.
+  defp unlink_symlink_operand(fs, resolved) do
+    case FS.lstat(fs, resolved) do
+      {:ok, %VFS.Stat{type: :symlink}, fs} -> FS.rm(fs, resolved)
+      {:ok, _stat, fs} -> {:ok, fs}
+      {:error, _} -> {:ok, fs}
     end
   end
 end
