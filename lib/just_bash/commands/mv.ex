@@ -46,6 +46,15 @@ defmodule JustBash.Commands.Mv do
 
             {:error, %VFS.Error{kind: :enotdir}} ->
               {Command.error("mv: cannot move '#{src}' to '#{dest}': Not a directory\n"), bash}
+
+            {:error, %VFS.Error{kind: :einval}} ->
+              {Command.error(
+                 "mv: cannot move '#{src}' to a subdirectory of itself, '#{dest_final}'\n"
+               ), bash}
+
+            {:error, %VFS.Error{} = error} ->
+              {Command.error("mv: cannot move '#{src}' to '#{dest}': #{FS.strerror(error)}\n"),
+               bash}
           end
         end
 
