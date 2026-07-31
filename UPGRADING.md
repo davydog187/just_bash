@@ -39,7 +39,66 @@ Every difference a script can observe, verified against the 0.3 sources:
    situation — mounts didn't exist in 0.3; on the default backend, `ln`
    output is byte-identical to 0.3, including the directory-hard-link
    message).
-7. **With additional mounts only** (a 0.4 capability): the parents of a
+7. **Writing through a regular file is now "Not a directory"** (exit 1),
+   as POSIX path resolution requires. 0.3 stored the entry anyway —
+   `echo hi > /m/j/2026/a.md` with `/m/j` a regular file exited 0, and the
+   file was readable by path but absent from `ls`, globs, `find`, and
+   `JustBash.FS.walk/3`. Every path-creating operation now refuses:
+   `>`, `>>`, `&>`, `2>`, `touch`, `cp`, `mv`, `tee`, `ln`, `mkdir`,
+   `mkdir -p`, and anything else that opens an output file.
+
+   `mkdir -p` names the offending *ancestor* rather than the whole
+   operand, matching GNU coreutils: `mkdir -p /m/j/2026` reports
+   `mkdir: cannot create directory '/m/j': Not a directory`, while
+   `mkdir` without `-p` still names the operand. `cp` reports a
+   destination under a regular file as
+   `cp: cannot stat 'PATH': Not a directory` (GNU stats the destination
+   before opening it); `cannot create regular file` remains the wording
+   for a merely missing parent.
+
+   Paths resolve component-by-component on *both* sides, so a write
+   *through a symlinked directory* lands on the target directory and is
+   readable back at the path used — `echo hi > /link/a.md` then
+   `cat /link/a.md` with `/link -> /real`. 0.3 stored an unreachable
+   literal `/link/a.md` key. `mkdir -p` on a path that already exists as
+   a *regular file* also fails now
+   (`mkdir: cannot create directory 'PATH': File exists`, exit 1) instead
+   of reporting success for a directory that does not exist, and so does
+   `mkdir -p` on a dangling symlink.
+
+   One deviation from POSIX remains: `..` is collapsed lexically before
+   resolution, so `echo hi > /m/j/../k.md` writes `/m/k.md` and exits 0
+   where bash reports `Not a directory`. Real resolution walks `..`
+   through the directory it lands in; this does not admit unreachable
+   state, so it stayed out of scope.
+
+   A **failed redirect no longer leaks the command's output.** The bytes
+   were bound for the file, so `echo hi > /m/j/a.md` now yields empty
+   stdout with the error on stderr; previously `result.stdout` still held
+   `"hi\n"`. Same for `2>`, `>>`, and `&>`, and for a redirect onto a
+   directory (`:eisdir`). bash produces no output at all here because it
+   opens the target before running the command.
+
+   Because resolution now follows symlinks in every component, `stat/2`
+   reports a symlinked directory *as* a directory — so **recursive commands
+   decide descent with `lstat` instead**, which is what GNU's default `-P`
+   does. `find`, `du`, `tree`, and `grep -r` list a symlink and stop there
+   rather than walking through it; in 0.3 `find /d` with `/d/self -> /d`
+   printed the subtree once per hop, and two such links never terminated.
+   Consequences worth knowing: `find -type f` and `-type d` no longer match
+   symlinks (`-type l` is now accepted and does), `grep -r` skips symlinks
+   met while recursing but still follows one named as an operand, and
+   `JustBash.FS.walk/3` yields a symlink with `type: :symlink` instead of
+   its target's type. A symlink named directly on the command line is still
+   followed, as it is under `-P`.
+
+   Relatedly, `JustBash.new(files: ...)`, `JustBash.FS.new/1`, and
+   `JustBash.FS.Memory.new/1` raise `ArgumentError` for a map that
+   describes an impossible shape, such as
+   `%{"/m/j" => "x", "/m/j/a.md" => "y"}` (0.3 accepted it and which entry
+   survived depended on map iteration order) or one that collides with a
+   directory the backend already holds, such as `%{"/" => "x"}`.
+8. **With additional mounts only** (a 0.4 capability): the parents of a
    mountpoint appear as synthetic directories, and foreign backends keep
    their own semantics — e.g. a plain `VFS.Memory` mount treats
    directories implicitly and refuses `rm` of an empty directory with

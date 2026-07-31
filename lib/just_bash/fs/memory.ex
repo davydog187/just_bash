@@ -76,7 +76,11 @@ defmodule JustBash.FS.Memory do
   - Simple form: `%{"/path/to/file" => "content"}`
   - Extended form: `%{"/path/to/file" => %{content: "content", mode: 0o755, mtime: ~U[...]}}`
 
-  Parent directories are created automatically.
+  Parent directories are created automatically. Raises `ArgumentError`
+  when the map is not realizable as a filesystem: either one entry's path
+  runs through another (see `validate_initial_files!/1`), or an entry
+  collides with a directory this backend already holds, as `%{"/" => "x"}`
+  does.
 
   ## Examples
 
@@ -86,6 +90,8 @@ defmodule JustBash.FS.Memory do
   """
   @spec new(map()) :: t()
   def new(initial_files \\ %{}) do
+    validate_initial_files!(initial_files)
+
     fs = %__MODULE__{
       data: %{"/" => %{type: :directory, mode: 0o755, mtime: DateTime.utc_now()}}
     }
@@ -93,75 +99,108 @@ defmodule JustBash.FS.Memory do
     Enum.reduce(initial_files, fs, fn {path, value}, acc ->
       case value do
         %{content: content} = init ->
-          {:ok, new_fs} =
-            write_file(acc, path, content,
-              mode: Map.get(init, :mode, 0o644),
-              mtime: Map.get(init, :mtime, DateTime.utc_now())
-            )
-
-          new_fs
+          seed!(acc, path, content,
+            mode: Map.get(init, :mode, 0o644),
+            mtime: Map.get(init, :mtime, DateTime.utc_now())
+          )
 
         content when is_binary(content) ->
-          {:ok, new_fs} = write_file(acc, path, content)
-          new_fs
+          seed!(acc, path, content)
       end
     end)
+  end
+
+  # `validate_initial_files!/1` catches the map that is unrealizable on its
+  # own terms; a seed can still collide with what the backend already holds
+  # (`%{"/" => "x"}`). Both are caller mistakes at construction time, so
+  # both raise `ArgumentError` rather than a `MatchError` from in here.
+  defp seed!(fs, path, content, opts \\ []) do
+    case write_file(fs, path, content, opts) do
+      {:ok, new_fs} ->
+        new_fs
+
+      {:error, %Error{} = error} ->
+        raise ArgumentError,
+              "invalid initial files: cannot create #{inspect(path)}: " <>
+                JustBash.FS.strerror(error)
+    end
+  end
+
+  @doc """
+  Validate an initial-files map before it is realized as a filesystem.
+
+  A map like `%{"/m/j" => "x", "/m/j/a.md" => "y"}` describes a
+  filesystem that cannot exist: `/m/j` is a regular file, so nothing can
+  live under it. Seeding it anyway used to store an entry no directory
+  listing could reach, and which one of the two entries won depended on
+  map iteration order. Raise instead, naming both paths.
+  """
+  @spec validate_initial_files!(map()) :: :ok
+  def validate_initial_files!(initial_files) do
+    by_path =
+      Map.new(initial_files, fn {path, _value} -> {normalize(path), path} end)
+
+    case find_conflict(by_path) do
+      nil ->
+        :ok
+
+      {ancestor, descendant} ->
+        raise ArgumentError,
+              "invalid initial files: #{inspect(ancestor)} is a regular file, so " <>
+                "#{inspect(descendant)} cannot exist under it (POSIX path resolution " <>
+                "fails with ENOTDIR). Drop one of the two entries."
+    end
   end
 
   @doc """
   Write content to a file, creating it if it doesn't exist.
 
-  Parent directories are created automatically. Accepts `:mode` and
-  `:mtime` options; these also flow through `VFS.write_file/4` opts.
+  Missing parent directories are created automatically. Accepts `:mode`
+  and `:mtime` options; these also flow through `VFS.write_file/4` opts.
 
-  Follows symlinks to the final target (POSIX `O_TRUNC` semantics,
-  matching `append_file/3`): the link survives and the target is
-  replaced; writing to a dangling symlink creates the target.
+  Follows symlinks in every component (POSIX path resolution), including
+  the final one (`O_TRUNC` semantics, matching `append_file/3`): the link
+  survives and the target is replaced; writing to a dangling symlink
+  creates the target. A non-final component that resolves to a regular
+  file is `:enotdir`.
   """
   @spec write_file(t(), String.t(), binary(), write_opts()) ::
           {:ok, t()} | {:error, Error.t()}
   def write_file(%__MODULE__{} = fs, path, content, opts \\ []) do
     normalized = normalize(path)
 
-    case resolve_final_path(fs, normalized, MapSet.new()) do
-      {:error, :eloop} ->
-        {:error, Error.new(:eloop, path: normalized)}
+    with {:ok, target_path} <- resolve_path(fs, normalized) do
+      case Map.get(fs.data, target_path) do
+        %{type: :directory} ->
+          {:error, Error.new(:eisdir, path: normalized)}
 
-      {:ok, target_path} ->
-        case Map.get(fs.data, target_path) do
-          %{type: :directory} ->
-            {:error, Error.new(:eisdir, path: normalized)}
+        _ ->
+          mode = Keyword.get(opts, :mode, 0o644)
+          mtime = Keyword.get(opts, :mtime, DateTime.utc_now())
 
-          _ ->
-            mode = Keyword.get(opts, :mode, 0o644)
-            mtime = Keyword.get(opts, :mtime, DateTime.utc_now())
-
-            fs = ensure_parent_dirs(fs, target_path)
-            entry = %{type: :file, content: content, mode: mode, mtime: mtime}
-            {:ok, %{fs | data: Map.put(fs.data, target_path, entry)}}
-        end
+          fs = ensure_parent_dirs(fs, target_path)
+          entry = %{type: :file, content: content, mode: mode, mtime: mtime}
+          {:ok, %{fs | data: Map.put(fs.data, target_path, entry)}}
+      end
     end
   end
 
   @doc """
   Get stat information for a path without following symlinks.
 
-  A symlink reports `type: :symlink` with the target's byte size.
+  A symlink reports `type: :symlink` with the target's byte size. Ancestor
+  components still resolve — only the final one is left alone.
   """
   @spec lstat(t(), String.t()) :: {:ok, Stat.t(), t()} | {:error, Error.t()}
-  def lstat(%__MODULE__{data: data} = fs, path) do
-    normalized = normalize(path)
+  def lstat(%__MODULE__{} = fs, path) do
+    with {:ok, normalized} <- resolve_for_create(fs, normalize(path)) do
+      case Map.get(fs.data, normalized) do
+        nil ->
+          {:error, Error.new(:enoent, path: normalized)}
 
-    case Map.get(data, normalized) do
-      nil ->
-        {:error, Error.new(:enoent, path: normalized)}
-
-      %{type: :symlink, target: target} = entry ->
-        {:ok,
-         %Stat{type: :symlink, size: byte_size(target), mtime: entry.mtime, mode: entry.mode}, fs}
-
-      entry ->
-        {:ok, entry_stat(entry), fs}
+        entry ->
+          {:ok, entry_stat(entry), fs}
+      end
     end
   end
 
@@ -173,29 +212,31 @@ defmodule JustBash.FS.Memory do
   within this backend's namespace (mount-local, chroot-like).
   """
   @spec symlink(t(), String.t(), String.t()) :: {:ok, t()} | {:error, Error.t()}
-  def symlink(%__MODULE__{data: data} = fs, target, link_path) do
-    normalized = normalize(link_path)
-
-    if Map.has_key?(data, normalized) do
-      {:error, Error.new(:eexist, path: normalized)}
-    else
-      fs = ensure_parent_dirs(fs, normalized)
-      entry = %{type: :symlink, target: target, mode: 0o777, mtime: DateTime.utc_now()}
-      {:ok, %{fs | data: Map.put(fs.data, normalized, entry)}}
+  def symlink(%__MODULE__{} = fs, target, link_path) do
+    with {:ok, normalized} <- resolve_for_create(fs, normalize(link_path)) do
+      if Map.has_key?(fs.data, normalized) do
+        {:error, Error.new(:eexist, path: normalized)}
+      else
+        fs = ensure_parent_dirs(fs, normalized)
+        entry = %{type: :symlink, target: target, mode: 0o777, mtime: DateTime.utc_now()}
+        {:ok, %{fs | data: Map.put(fs.data, normalized, entry)}}
+      end
     end
   end
 
   @doc """
   Read the target of a symbolic link.
+
+  Ancestor components resolve; the final one is the link being read.
   """
   @spec readlink(t(), String.t()) :: {:ok, String.t(), t()} | {:error, Error.t()}
-  def readlink(%__MODULE__{data: data} = fs, path) do
-    normalized = normalize(path)
-
-    case Map.get(data, normalized) do
-      nil -> {:error, Error.new(:enoent, path: normalized)}
-      %{type: :symlink, target: target} -> {:ok, target, fs}
-      _ -> {:error, Error.new(:einval, path: normalized)}
+  def readlink(%__MODULE__{} = fs, path) do
+    with {:ok, normalized} <- resolve_for_create(fs, normalize(path)) do
+      case Map.get(fs.data, normalized) do
+        nil -> {:error, Error.new(:enoent, path: normalized)}
+        %{type: :symlink, target: target} -> {:ok, target, fs}
+        _ -> {:error, Error.new(:einval, path: normalized)}
+      end
     end
   end
 
@@ -208,10 +249,14 @@ defmodule JustBash.FS.Memory do
   need inode indirection in the entry model.
   """
   @spec link(t(), String.t(), String.t()) :: {:ok, t()} | {:error, Error.t()}
-  def link(%__MODULE__{data: data} = fs, existing_path, new_path) do
-    existing_norm = normalize(existing_path)
-    new_norm = normalize(new_path)
+  def link(%__MODULE__{} = fs, existing_path, new_path) do
+    with {:ok, new_norm} <- resolve_for_create(fs, normalize(new_path)),
+         {:ok, existing_norm} <- resolve_for_create(fs, normalize(existing_path)) do
+      do_link(fs, existing_norm, new_norm)
+    end
+  end
 
+  defp do_link(%__MODULE__{data: data} = fs, existing_norm, new_norm) do
     cond do
       not Map.has_key?(data, existing_norm) ->
         {:error, Error.new(:enoent, path: existing_norm)}
@@ -240,19 +285,15 @@ defmodule JustBash.FS.Memory do
   def chmod(%__MODULE__{} = fs, path, mode) do
     normalized = normalize(path)
 
-    case resolve_final_path(fs, normalized, MapSet.new()) do
-      {:error, :eloop} ->
-        {:error, Error.new(:eloop, path: normalized)}
+    with {:ok, target_path} <- resolve_path(fs, normalized) do
+      case Map.get(fs.data, target_path) do
+        nil ->
+          {:error, Error.new(:enoent, path: normalized)}
 
-      {:ok, target_path} ->
-        case Map.get(fs.data, target_path) do
-          nil ->
-            {:error, Error.new(:enoent, path: normalized)}
-
-          entry ->
-            updated = %{entry | mode: mode}
-            {:ok, %{fs | data: Map.put(fs.data, target_path, updated)}}
-        end
+        entry ->
+          updated = %{entry | mode: mode}
+          {:ok, %{fs | data: Map.put(fs.data, target_path, updated)}}
+      end
     end
   end
 
@@ -262,28 +303,25 @@ defmodule JustBash.FS.Memory do
   Follows symlinks to the final target (POSIX `O_APPEND` semantics): the
   link survives and the target receives the bytes; appending to a
   dangling symlink creates the target. Preserves the file's existing
-  mode, unlike a read+write composition.
+  mode, unlike a read+write composition. A non-final path component that
+  resolves to a regular file is `:enotdir`.
   """
   @spec append_file(t(), String.t(), binary()) :: {:ok, t()} | {:error, Error.t()}
   def append_file(%__MODULE__{} = fs, path, content) do
     normalized = normalize(path)
 
-    case resolve_final_path(fs, normalized, MapSet.new()) do
-      {:error, :eloop} ->
-        {:error, Error.new(:eloop, path: normalized)}
+    with {:ok, target_path} <- resolve_path(fs, normalized) do
+      case Map.get(fs.data, target_path) do
+        %{type: :directory} ->
+          {:error, Error.new(:eisdir, path: normalized)}
 
-      {:ok, target_path} ->
-        case Map.get(fs.data, target_path) do
-          %{type: :directory} ->
-            {:error, Error.new(:eisdir, path: normalized)}
+        %{type: :file} = entry ->
+          updated = %{entry | content: entry.content <> content, mtime: DateTime.utc_now()}
+          {:ok, %{fs | data: Map.put(fs.data, target_path, updated)}}
 
-          %{type: :file} = entry ->
-            updated = %{entry | content: entry.content <> content, mtime: DateTime.utc_now()}
-            {:ok, %{fs | data: Map.put(fs.data, target_path, updated)}}
-
-          nil ->
-            write_file(fs, target_path, content)
-        end
+        nil ->
+          write_file(fs, target_path, content)
+      end
     end
   end
 
@@ -294,10 +332,20 @@ defmodule JustBash.FS.Memory do
   def __entry__(%__MODULE__{data: data}, path), do: Map.get(data, path)
 
   @doc false
-  @spec __resolve_entry__(t(), String.t()) ::
-          {:ok, fs_entry()} | {:error, :enoent | :eloop}
+  @spec __resolve_entry__(t(), String.t()) :: {:ok, fs_entry()} | {:error, Error.t()}
   def __resolve_entry__(%__MODULE__{} = fs, path) do
-    do_resolve_entry(fs, normalize(path), MapSet.new())
+    with {:ok, resolved} <- resolve_path(fs, normalize(path)) do
+      case Map.get(fs.data, resolved) do
+        nil -> {:error, Error.new(:enoent, path: resolved)}
+        entry -> {:ok, entry}
+      end
+    end
+  end
+
+  @doc false
+  @spec __resolve_for_read__(t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def __resolve_for_read__(%__MODULE__{} = fs, path) do
+    resolve_path(fs, normalize(path))
   end
 
   @doc false
@@ -307,6 +355,12 @@ defmodule JustBash.FS.Memory do
   @doc false
   @spec __normalize__(String.t()) :: String.t()
   def __normalize__(path), do: normalize(path)
+
+  @doc false
+  @spec __resolve_for_create__(t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def __resolve_for_create__(%__MODULE__{} = fs, path) do
+    resolve_for_create(fs, normalize(path))
+  end
 
   # Tolerant normalization: unlike `VFS.Path.normalize/1`, accepts
   # relative and empty inputs by rooting them at "/". Backend-internal
@@ -323,6 +377,10 @@ defmodule JustBash.FS.Memory do
 
   defp entry_stat(%{type: :directory} = entry) do
     %Stat{type: :directory, size: 0, mtime: entry.mtime, mode: entry.mode}
+  end
+
+  defp entry_stat(%{type: :symlink, target: target} = entry) do
+    %Stat{type: :symlink, size: byte_size(target), mtime: entry.mtime, mode: entry.mode}
   end
 
   defp ensure_parent_dirs(%__MODULE__{} = fs, path) do
@@ -342,42 +400,110 @@ defmodule JustBash.FS.Memory do
     end
   end
 
-  @dialyzer {:nowarn_function, do_resolve_entry: 3}
-  defp do_resolve_entry(%__MODULE__{data: data} = fs, path, seen) do
-    case Map.get(data, path) do
-      nil ->
-        {:error, :enoent}
+  # ── POSIX path resolution ────────────────────────────────────────────────
+  #
+  # A path resolves one component at a time from the root, following
+  # symlinks as they are met. Every non-final component must resolve to a
+  # directory or to nothing (writes create the missing intermediate
+  # directories); one that resolves to a regular file is ENOTDIR, exactly
+  # as the kernel reports it. Without that check a write stored an entry
+  # underneath a regular file — readable by its path, yet unreachable from
+  # any directory listing or `VFS.walk/3` (issue #53).
+  #
+  # Reads resolve the same way, and have to: if only writes followed
+  # intermediate symlinks, a write through a symlinked directory would land
+  # on the target and be invisible at the path the caller used — the same
+  # unreachable-state bug mirrored, and quieter, because the write reports
+  # success.
+  #
+  # One deviation remains, inherited from `normalize/1`: ".." is collapsed
+  # lexically before resolution, so "/m/j/../k" never looks at "/m/j" and
+  # cannot report ENOTDIR for it. Real resolution walks ".." through the
+  # directory it lands in.
 
-      %{type: :symlink, target: target} ->
-        if MapSet.member?(seen, path) do
-          {:error, :eloop}
-        else
-          resolved = resolve_symlink_target(path, target)
-          do_resolve_entry(fs, resolved, MapSet.put(seen, path))
-        end
+  # Symlink hops are budgeted, not remembered, matching Linux's
+  # SYMLOOP_MAX. A set of visited links would reject legitimate paths that
+  # cross the same link twice: with `/real/self -> /real`,
+  # "/real/self/self/x" is two hops to "/real/x", not a cycle.
+  @symloop_max 40
 
-      entry ->
-        {:ok, entry}
+  # Reads and writes resolve identically, including a symlink at the final
+  # component (O_TRUNC/O_APPEND/chmod semantics, where the link is written
+  # through). They differ only in what the caller does with a resolved path
+  # that holds nothing: a write creates it, a read reports ENOENT.
+  @spec resolve_path(t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  defp resolve_path(%__MODULE__{} = fs, path) do
+    walk(fs, "/", components(path), @symloop_max, :follow_final)
+  end
+
+  # Resolve every component *except* the final one, which is taken
+  # literally: mkdir/symlink/link semantics, where an existing final
+  # component is EEXIST rather than a link to follow, and lstat/readlink/rm
+  # semantics, where the link itself is the subject.
+  @spec resolve_for_create(t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  defp resolve_for_create(%__MODULE__{} = fs, path) do
+    walk(fs, "/", components(path), @symloop_max, :keep_final)
+  end
+
+  defp components("/"), do: []
+  defp components("/" <> rest), do: String.split(rest, "/")
+
+  # `parent` is the resolved prefix walked so far; splitting once and
+  # descending with it keeps resolution a single pass, rather than taking
+  # the path apart with dirname/basename at every level.
+  defp walk(_fs, resolved, [], _hops, _final), do: {:ok, resolved}
+
+  defp walk(%__MODULE__{data: data} = fs, parent, [component | rest], hops, final) do
+    candidate = join_child(parent, component)
+
+    case Map.get(data, candidate) do
+      %{type: :symlink, target: target} when rest != [] or final == :follow_final ->
+        follow(fs, candidate, target, rest, hops, final)
+
+      %{type: :file} when rest != [] ->
+        {:error, Error.new(:enotdir, path: candidate)}
+
+      # A directory, nothing at all (a write creates it), or the final
+      # component of a `:keep_final` resolution.
+      _ ->
+        walk(fs, candidate, rest, hops, final)
     end
   end
 
-  # Walk a symlink chain to the final (non-symlink) path. A missing entry
-  # terminates the walk with the path it would occupy — that is where an
-  # append through a dangling link creates the file.
-  @dialyzer {:nowarn_function, resolve_final_path: 3}
-  defp resolve_final_path(%__MODULE__{data: data} = fs, path, seen) do
-    case Map.get(data, path) do
-      %{type: :symlink, target: target} ->
-        if MapSet.member?(seen, path) do
-          {:error, :eloop}
-        else
-          resolved = resolve_symlink_target(path, target)
-          resolve_final_path(fs, resolved, MapSet.put(seen, path))
-        end
+  defp follow(_fs, candidate, _target, _rest, 0, _final) do
+    {:error, Error.new(:eloop, path: candidate)}
+  end
 
-      _ ->
-        {:ok, path}
-    end
+  defp follow(%__MODULE__{} = fs, candidate, target, rest, hops, final) do
+    target_components = candidate |> resolve_symlink_target(target) |> components()
+    walk(fs, "/", target_components ++ rest, hops - 1, final)
+  end
+
+  defp join_child("/", child), do: "/" <> child
+  defp join_child(parent, child), do: parent <> "/" <> child
+
+  # An initial-files entry conflicts when another entry is one of its
+  # ancestors: that ancestor is a regular file, so the deeper path cannot
+  # exist. Checking ancestors (rather than string prefixes) keeps
+  # "/m/jj" and "/m/j" independent.
+  defp find_conflict(by_path) do
+    Enum.find_value(by_path, fn {path, original} ->
+      path
+      |> ancestors()
+      |> Enum.find_value(fn ancestor ->
+        case Map.fetch(by_path, ancestor) do
+          {:ok, ancestor_original} -> {ancestor_original, original}
+          :error -> nil
+        end
+      end)
+    end)
+  end
+
+  defp ancestors("/"), do: []
+
+  defp ancestors(path) do
+    parent = VPath.dirname(path)
+    if parent == "/", do: [], else: [parent | ancestors(parent)]
   end
 
   defp resolve_symlink_target(symlink_path, target) do
@@ -395,62 +521,93 @@ defimpl VFS.Mountable, for: JustBash.FS.Memory do
   alias JustBash.FS.Memory
   alias VFS.Error
 
+  # `exists?` resolves ancestors but not the final component, so a dangling
+  # symlink still exists (as the link).
   def exists?(%Memory{} = fs, path) do
-    {Map.has_key?(fs.data, Memory.__normalize__(path)), fs}
+    case Memory.__resolve_for_create__(fs, path) do
+      {:ok, resolved} -> {Map.has_key?(fs.data, resolved), fs}
+      {:error, _error} -> {false, fs}
+    end
   end
 
   def stat(%Memory{} = fs, path) do
-    normalized = Memory.__normalize__(path)
-
-    case Memory.__resolve_entry__(fs, normalized) do
+    case Memory.__resolve_entry__(fs, path) do
       {:ok, entry} -> {:ok, Memory.__entry_stat__(entry), fs}
-      {:error, kind} -> {:error, Error.new(kind, path: normalized)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  # Native walk, replacing the `VFS.Default` one composed from stat/readdir.
+  # Two reasons, and the first is correctness, not speed: the default walk
+  # asks `stat/2` whether each entry is a directory, and `stat/2` resolves
+  # symlinks — so it descends *through* a symlinked directory and back into
+  # the tree it came from. One self-link inflates the result, two make it
+  # diverge. Walking the store's own keys instead cannot: a symlink is an
+  # entry, never an edge, so the traversal visits each stored path once and
+  # stops (POSIX `-P`, and what GNU's traversal utilities do by default).
+  #
+  # The second reason is that it is exact and O(n). With ENOTDIR enforced at
+  # every write, `data`'s keys *are* the reachable tree, so a prefix scan
+  # sees precisely what a stat/readdir descent would have — no re-resolution
+  # per level.
+  def walk(%Memory{} = fs, root, opts) do
+    requested = Memory.__normalize__(root)
+    max_depth = Keyword.get(opts, :max_depth, :infinity)
+    include_dirs = Keyword.get(opts, :include_dirs, false)
+
+    # The root operand is followed, like `stat/2` — `walk("/link")` walks the
+    # target's tree. Emitted paths keep the caller's spelling of the root,
+    # which is what a stat/readdir descent from "/link" produced.
+    case Memory.__resolve_for_read__(fs, requested) do
+      {:ok, resolved} ->
+        walk_root(fs, resolved, requested, max_depth, include_dirs)
+
+      {:error, %Error{}} ->
+        []
     end
   end
 
   def readdir(%Memory{data: data} = fs, path) do
-    normalized = Memory.__normalize__(path)
+    with {:ok, normalized} <- Memory.__resolve_for_read__(fs, path) do
+      case Map.get(data, normalized) do
+        nil ->
+          {:error, Error.new(:enoent, path: normalized)}
 
-    case Map.get(data, normalized) do
-      nil ->
-        {:error, Error.new(:enoent, path: normalized)}
+        %{type: type} when type != :directory ->
+          {:error, Error.new(:enotdir, path: normalized)}
 
-      %{type: type} when type != :directory ->
-        {:error, Error.new(:enotdir, path: normalized)}
+        %{type: :directory} ->
+          prefix = if normalized == "/", do: "/", else: normalized <> "/"
 
-      %{type: :directory} ->
-        prefix = if normalized == "/", do: "/", else: normalized <> "/"
+          entries =
+            data
+            |> Map.keys()
+            |> Enum.filter(fn p -> p != normalized and String.starts_with?(p, prefix) end)
+            |> Enum.map(fn p ->
+              rest = String.replace_prefix(p, prefix, "")
+              rest |> String.split("/", parts: 2) |> hd()
+            end)
+            |> Enum.uniq()
+            |> Enum.sort()
 
-        entries =
-          data
-          |> Map.keys()
-          |> Enum.filter(fn p -> p != normalized and String.starts_with?(p, prefix) end)
-          |> Enum.map(fn p ->
-            rest = String.replace_prefix(p, prefix, "")
-            rest |> String.split("/", parts: 2) |> hd()
-          end)
-          |> Enum.uniq()
-          |> Enum.sort()
-
-        {:ok, entries, fs}
+          {:ok, entries, fs}
+      end
     end
   end
 
   def stream_read(%Memory{} = fs, path, opts) do
-    normalized = Memory.__normalize__(path)
-
-    case Memory.__resolve_entry__(fs, normalized) do
+    case Memory.__resolve_entry__(fs, path) do
       {:ok, %{type: :file, content: content}} ->
         case VFS.StreamOptions.apply(content, opts) do
           {:ok, stream} -> {:ok, stream, fs}
-          {:error, kind} -> {:error, Error.new(kind, path: normalized)}
+          {:error, kind} -> {:error, Error.new(kind, path: Memory.__normalize__(path))}
         end
 
       {:ok, %{type: :directory}} ->
-        {:error, Error.new(:eisdir, path: normalized)}
+        {:error, Error.new(:eisdir, path: Memory.__normalize__(path))}
 
-      {:error, kind} ->
-        {:error, Error.new(kind, path: normalized)}
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
@@ -458,10 +615,115 @@ defimpl VFS.Mountable, for: JustBash.FS.Memory do
     Memory.write_file(fs, path, content, opts)
   end
 
-  def mkdir(%Memory{data: data} = fs, path, opts) do
-    normalized = Memory.__normalize__(path)
-    parents? = Keyword.get(opts, :parents, false)
+  # Every ancestor must resolve to a directory (or to nothing, when
+  # `parents: true` will create it); an ancestor that is a regular file is
+  # ENOTDIR, and `mkdir -p` must refuse rather than bury the new directory
+  # under it.
+  def mkdir(%Memory{} = fs, path, opts) do
+    with {:ok, resolved} <- Memory.__resolve_for_create__(fs, path) do
+      do_mkdir_resolved(fs, resolved, Keyword.get(opts, :parents, false))
+    end
+  end
 
+  # Ancestors resolve, the final component does not: `rm /link` unlinks the
+  # symlink, it does not touch what the link points at.
+  def rm(%Memory{data: data} = fs, path, opts) do
+    recursive? = Keyword.get(opts, :recursive, false)
+
+    with {:ok, normalized} <- Memory.__resolve_for_create__(fs, path) do
+      case Map.get(data, normalized) do
+        nil ->
+          {:error, Error.new(:enoent, path: normalized)}
+
+        %{type: :directory} ->
+          rm_directory(fs, normalized, recursive?)
+
+        _ ->
+          {:ok, %{fs | data: Map.delete(data, normalized)}}
+      end
+    end
+  end
+
+  def capabilities(_), do: MapSet.new([:read, :write, :mkdir])
+
+  # ── helpers ──
+
+  defp walk_root(%Memory{} = fs, resolved, requested, max_depth, include_dirs) do
+    case Memory.__entry__(fs, resolved) do
+      # A dangling symlink root resolves to a path that holds nothing, which
+      # the default walk also reported as an empty traversal.
+      nil ->
+        []
+
+      %{type: :directory} = entry ->
+        self = if include_dirs, do: [{requested, Memory.__entry_stat__(entry)}], else: []
+
+        opts = %{
+          index: child_index(fs, resolved),
+          max_depth: max_depth,
+          include_dirs: include_dirs
+        }
+
+        Stream.concat(self, descend(opts, resolved, requested, 0))
+
+      entry ->
+        [{requested, Memory.__entry_stat__(entry)}]
+    end
+  end
+
+  # One pass over the store builds `storage dir => sorted [{name, entry}]`,
+  # so the depth-first traversal below is a map lookup per directory rather
+  # than a prefix scan per directory. Sorting matches `readdir/2`'s order,
+  # which is the order the composed walk yielded.
+  defp child_index(%Memory{data: data}, resolved) do
+    prefix = if resolved == "/", do: "/", else: resolved <> "/"
+
+    data
+    |> Enum.filter(fn {path, _entry} ->
+      path != resolved and String.starts_with?(path, prefix)
+    end)
+    |> Enum.group_by(fn {path, _entry} -> VFS.Path.dirname(path) end, fn {path, entry} ->
+      {Path.basename(path), entry}
+    end)
+    |> Map.new(fn {dir, children} -> {dir, Enum.sort(children)} end)
+  end
+
+  # `storage` addresses the store, `display` is the caller's spelling of the
+  # same directory — they differ only when the walk root was a symlink.
+  # Depth is counted from the root, as `:max_depth` is documented.
+  #
+  # Every stage is a `Stream`, so the laziness the `VFS.Mountable` walk
+  # contract asks for survives: `walk |> Stream.take(n)` realizes only the
+  # subtrees it needs.
+  defp descend(%{max_depth: max_depth}, _storage, _display, depth)
+       when is_integer(max_depth) and depth >= max_depth do
+    []
+  end
+
+  defp descend(opts, storage, display, depth) do
+    opts.index
+    |> Map.get(storage, [])
+    |> Stream.flat_map(fn {name, entry} ->
+      emit(opts, join(storage, name), join(display, name), entry, depth + 1)
+    end)
+  end
+
+  defp emit(opts, storage, display, %{type: :directory} = entry, depth) do
+    self = if opts.include_dirs, do: [{display, Memory.__entry_stat__(entry)}], else: []
+
+    Stream.concat(self, descend(opts, storage, display, depth))
+  end
+
+  # A symlink lands here too: it is an entry in the store, never an edge to
+  # follow, which is exactly what keeps the traversal finite.
+  defp emit(_opts, _storage, display, entry, _depth) do
+    [{display, Memory.__entry_stat__(entry)}]
+  end
+
+  defp join("/", name), do: "/" <> name
+  defp join(dir, name), do: dir <> "/" <> name
+
+  defp do_mkdir_resolved(%Memory{data: data} = fs, normalized, parents?) do
     case Map.get(data, normalized) do
       %{type: type} when type != :directory ->
         {:error, Error.new(:eexist, path: normalized)}
@@ -477,26 +739,6 @@ defimpl VFS.Mountable, for: JustBash.FS.Memory do
     end
   end
 
-  def rm(%Memory{data: data} = fs, path, opts) do
-    normalized = Memory.__normalize__(path)
-    recursive? = Keyword.get(opts, :recursive, false)
-
-    case Map.get(data, normalized) do
-      nil ->
-        {:error, Error.new(:enoent, path: normalized)}
-
-      %{type: :directory} ->
-        rm_directory(fs, normalized, recursive?)
-
-      _ ->
-        {:ok, %{fs | data: Map.delete(data, normalized)}}
-    end
-  end
-
-  def capabilities(_), do: MapSet.new([:read, :write, :mkdir])
-
-  # ── helpers ──
-
   defp mkdir_with_parent(%Memory{data: data} = fs, normalized, parents?) do
     parent = VFS.Path.dirname(normalized)
     parent_exists = parent == "/" or Map.has_key?(data, parent)
@@ -505,9 +747,13 @@ defimpl VFS.Mountable, for: JustBash.FS.Memory do
       {false, false} ->
         {:error, Error.new(:enoent, path: normalized)}
 
+      # The whole chain was already resolved by the outer `mkdir/3`. Going
+      # back through the protocol would re-resolve it once per level, which
+      # is O(depth^2) resolutions for a single `mkdir -p`.
       {false, true} ->
-        {:ok, fs} = mkdir(fs, parent, parents: true)
-        do_mkdir(fs, normalized)
+        with {:ok, fs} <- do_mkdir_resolved(fs, parent, true) do
+          do_mkdir(fs, normalized)
+        end
 
       {true, _} ->
         do_mkdir(fs, normalized)
