@@ -8,7 +8,7 @@ defmodule JustBash.Commands.Date do
       `%D` (`%m/%d/%y`)
     * date — `%Y`, `%y`, `%C`, `%m`, `%d`, `%e` (space-padded), `%j`,
       `%a`, `%A`, `%b`, `%h`, `%B`, `%u`, `%w`
-    * time — `%H`, `%M`, `%S`, `%I`, `%p`, `%P`, `%Z`, `%s`
+    * time — `%H`, `%M`, `%S`, `%N`, `%I`, `%p`, `%P`, `%Z`, `%s`
     * literal — `%%`, `%n`, `%t`
 
   An unrecognized directive is emitted verbatim (`%J` → `%J`), as GNU date does,
@@ -52,8 +52,7 @@ defmodule JustBash.Commands.Date do
 
   defp parse_args([], opts), do: {:ok, opts}
 
-  # `-I` and an explicit `+format` are two answers to the same question, and real
-  # date refuses to guess which one was meant rather than silently dropping one.
+  # Real date rejects competing output formats rather than picking one.
   defp parse_args(["+" <> _format | _rest], %{iso_format: iso}) when iso != nil do
     {:error, "date: multiple output formats specified\n"}
   end
@@ -62,10 +61,6 @@ defmodule JustBash.Commands.Date do
     parse_args(rest, %{opts | format: format})
   end
 
-  # `-I[FMT]` / `--iso-8601[=FMT]`: ISO 8601 output at the requested precision.
-  # These used to fall through the catch-all clause at the bottom and be silently
-  # ignored, so `date -I` printed the full default format — a flag that changes
-  # the output shape appearing to do nothing at all.
   defp parse_args(["-I" <> spec | rest], opts), do: put_iso_format(spec, rest, opts)
   defp parse_args(["--iso-8601" | rest], opts), do: put_iso_format("", rest, opts)
 
@@ -130,11 +125,7 @@ defmodule JustBash.Commands.Date do
   defp iso_format("hours"), do: {:ok, "%Y-%m-%dT%H+00:00"}
   defp iso_format("minutes"), do: {:ok, "%Y-%m-%dT%H:%M+00:00"}
   defp iso_format("seconds"), do: {:ok, "%Y-%m-%dT%H:%M:%S+00:00"}
-
-  defp iso_format(spec) when spec in ["ns", "date,ns"] do
-    {:ok, "%Y-%m-%dT%H:%M:%S,000000000+00:00"}
-  end
-
+  defp iso_format("ns"), do: {:ok, "%Y-%m-%dT%H:%M:%S,%N+00:00"}
   defp iso_format(_spec), do: :error
 
   defp parse_formatted_date(date_str, format) do
@@ -188,23 +179,12 @@ defmodule JustBash.Commands.Date do
 
   defp parse_relative_date(_), do: {:error, :invalid_format}
 
-  # A single left-to-right scan over the format string, NOT a chain of
-  # `String.replace/3`.
-  #
-  # Chained replacement cannot express escaping: it rewrote `%Y` everywhere
-  # before it ever considered `%%`, so `%%Y` — a literal percent followed by Y —
-  # came out as `%2024`. No ordering fixes that, because by the time a later pass
-  # runs it can no longer tell which percents an earlier pass already consumed.
-  # Scanning consumes each directive exactly once, so `%%` is just another
-  # two-character directive and the ambiguity disappears.
-  #
-  # An unrecognized directive is emitted verbatim (`%J` -> `%J`), matching GNU
-  # date. That matters more than it looks: the reason this function was rewritten
-  # is that an unimplemented `%F` printed the literal text "%F" while exiting 0,
-  # so an agent asking the sandbox for today's date got "%F" back and believed
-  # it. Passing unknown directives through keeps that visible rather than
-  # inventing a value — and every directive a caller is likely to reach for is
-  # now implemented.
+  # A single left-to-right scan consumes each directive exactly once, so `%%`
+  # escaping works — chained String.replace/3 cannot express it (`%%Y` became
+  # `%2024`). Unknown directives pass through verbatim (`%J` -> `%J`), matching
+  # GNU date. The scan is byte-wise, not codepoint-wise: format strings are raw
+  # binaries and need not be valid UTF-8; every known directive is ASCII, and
+  # passthrough reconstructs other bytes verbatim either way.
   defp format_datetime(datetime, format), do: scan(format, datetime, [])
 
   defp scan(<<>>, _datetime, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
@@ -212,16 +192,16 @@ defmodule JustBash.Commands.Date do
   # A trailing bare `%` is literal, as in real date.
   defp scan(<<?%>>, datetime, acc), do: scan(<<>>, datetime, ["%" | acc])
 
-  defp scan(<<?%, directive::utf8, rest::binary>>, datetime, acc) do
+  defp scan(<<?%, directive, rest::binary>>, datetime, acc) do
     scan(rest, datetime, [directive(directive, datetime) | acc])
   end
 
-  defp scan(<<char::utf8, rest::binary>>, datetime, acc) do
-    scan(rest, datetime, [<<char::utf8>> | acc])
+  defp scan(<<char, rest::binary>>, datetime, acc) do
+    scan(rest, datetime, [<<char>> | acc])
   end
 
-  # Compound directives, composed from their single-field parts so the two can't
-  # drift. `%F` is the one that started all this.
+  # Compound directives are composed from their single-field parts so the two
+  # can't drift.
   defp directive(?F, dt), do: "#{directive(?Y, dt)}-#{directive(?m, dt)}-#{directive(?d, dt)}"
   defp directive(?T, dt), do: "#{directive(?H, dt)}:#{directive(?M, dt)}:#{directive(?S, dt)}"
   defp directive(?R, dt), do: "#{directive(?H, dt)}:#{directive(?M, dt)}"
@@ -241,7 +221,13 @@ defmodule JustBash.Commands.Date do
   defp directive(?I, dt), do: dt.hour |> twelve_hour() |> pad2()
   defp directive(?p, dt), do: if(dt.hour < 12, do: "AM", else: "PM")
   defp directive(?P, dt), do: dt |> directive(?p) |> String.downcase()
-  defp directive(?Z, dt), do: dt.zone_abbr || "UTC"
+  defp directive(?Z, dt), do: dt.zone_abbr
+
+  defp directive(?N, dt) do
+    {microsecond, _precision} = dt.microsecond
+    (microsecond * 1_000) |> Integer.to_string() |> String.pad_leading(9, "0")
+  end
+
   defp directive(?s, dt), do: Integer.to_string(DateTime.to_unix(dt))
   defp directive(?a, dt), do: short_day_name(dt)
   defp directive(?A, dt), do: full_day_name(dt)
@@ -254,7 +240,7 @@ defmodule JustBash.Commands.Date do
   defp directive(?n, _dt), do: "\n"
   defp directive(?t, _dt), do: "\t"
   defp directive(?%, _dt), do: "%"
-  defp directive(other, _dt), do: <<?%, other::utf8>>
+  defp directive(other, _dt), do: <<?%, other>>
 
   defp pad2(n), do: n |> Integer.to_string() |> String.pad_leading(2, "0")
 

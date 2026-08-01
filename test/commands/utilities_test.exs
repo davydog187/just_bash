@@ -286,10 +286,6 @@ defmodule JustBash.Commands.UtilitiesTest do
     end
   end
 
-  # `date +%F` is the single most common way to ask for today's date, and it
-  # used to emit the literal string "%F" — a silently wrong answer rather than
-  # an error, which is the worst failure mode a sandbox can have. An agent
-  # asking the sandbox what day it is got "%F" back and carried on.
   describe "compound format specifiers" do
     test "%F is the ISO date" do
       bash = JustBash.new()
@@ -353,11 +349,14 @@ defmodule JustBash.Commands.UtilitiesTest do
       {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%Z'")
       assert result.stdout == "UTC\n"
     end
+
+    test "%N is nanoseconds" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15T10:30:00.123456Z' '+%N'")
+      assert result.stdout == "123456000\n"
+    end
   end
 
-  # A single left-to-right scan, not a chain of String.replace/3 — otherwise an
-  # escaped percent gets eaten by whichever specifier its following character
-  # happens to name. `%%F` means a literal "%F" and must never become a date.
   describe "percent escaping" do
     test "%%F is a literal percent followed by F" do
       bash = JustBash.new()
@@ -382,11 +381,16 @@ defmodule JustBash.Commands.UtilitiesTest do
       {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%J'")
       assert result.stdout == "%J\n"
     end
+
+    # Format strings are raw binaries, not necessarily valid UTF-8.
+    test "a raw non-UTF-8 byte in the format passes through" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, ~S|date -d '2024-06-15 00:00:00' +$'\xff%Y'|)
+      assert result.exit_code == 0
+      assert result.stdout == <<0xFF>> <> "2024\n"
+    end
   end
 
-  # `-I` / `--iso-8601` was accepted and silently ignored, so it printed the
-  # full default format. Silently ignoring a flag that changes the output shape
-  # is the same class of bug as `%F`.
   describe "-I / --iso-8601" do
     test "-I prints just the date" do
       bash = JustBash.new()
@@ -421,13 +425,48 @@ defmodule JustBash.Commands.UtilitiesTest do
       assert result.stdout == "2024-06-15\n"
     end
 
-    # Measured against real `date`, which rejects this rather than picking one:
-    # "date: multiple output formats specified".
+    test "--iso-8601=seconds is the long form with a value" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' --iso-8601=seconds")
+      assert result.stdout == "2024-06-15T10:30:00+00:00\n"
+    end
+
+    test "-Ins includes the actual nanoseconds" do
+      bash = JustBash.new()
+      {r1, _} = JustBash.exec(bash, "date -d '2024-06-15T10:30:00.123456Z' -Ins")
+      {r2, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -Ins")
+      assert r1.stdout == "2024-06-15T10:30:00,123456000+00:00\n"
+      assert r2.stdout == "2024-06-15T10:30:00,000000000+00:00\n"
+    end
+
+    # Real date rejects competing output formats rather than picking one,
+    # in either argument order.
     test "-I together with an explicit +format is an error" do
       bash = JustBash.new()
       {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -I '+%Y'")
       assert result.exit_code == 1
       assert result.stderr =~ "multiple output formats specified"
+    end
+
+    test "+format followed by -I is also an error" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' '+%Y' -I")
+      assert result.exit_code == 1
+      assert result.stderr =~ "multiple output formats specified"
+    end
+
+    test "an invalid -I argument is an error" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -Ibogus")
+      assert result.exit_code == 1
+      assert result.stderr =~ "invalid argument 'bogus' for '--iso-8601'"
+    end
+
+    test "date,ns is rejected as real date rejects it" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date --iso-8601=date,ns")
+      assert result.exit_code == 1
+      assert result.stderr =~ "invalid argument 'date,ns' for '--iso-8601'"
     end
   end
 
