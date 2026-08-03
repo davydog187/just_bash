@@ -286,6 +286,202 @@ defmodule JustBash.Commands.UtilitiesTest do
     end
   end
 
+  describe "compound format specifiers" do
+    test "%F is the ISO date" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' '+%F'")
+      assert result.exit_code == 0
+      assert result.stdout == "2024-06-15\n"
+    end
+
+    test "%T is the 24-hour time" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:05' '+%T'")
+      assert result.stdout == "10:30:05\n"
+    end
+
+    test "%D is the US short date" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' '+%D'")
+      assert result.stdout == "06/15/24\n"
+    end
+
+    test "%R is hours and minutes" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:05' '+%R'")
+      assert result.stdout == "10:30\n"
+    end
+
+    test "%F and %T compose" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:05' '+%F %T'")
+      assert result.stdout == "2024-06-15 10:30:05\n"
+    end
+  end
+
+  describe "single-field format specifiers" do
+    test "%y is the two-digit year and %C the century" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%y %C'")
+      assert result.stdout == "24 20\n"
+    end
+
+    test "%e is the space-padded day of month" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-05 00:00:00' '+[%e]'")
+      assert result.stdout == "[ 5]\n"
+    end
+
+    test "%I and %p are the 12-hour clock" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+%I %p'")
+      assert result.stdout == "01 PM\n"
+    end
+
+    test "%I renders midnight as 12 AM" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:30:00' '+%I %p'")
+      assert result.stdout == "12 AM\n"
+    end
+
+    test "%P is the lowercase %p" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+%P'")
+      assert result.stdout == "pm\n"
+    end
+
+    test "%P renders midnight as am" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:30:00' '+%P'")
+      assert result.stdout == "am\n"
+    end
+
+    test "%Z is the timezone name" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%Z'")
+      assert result.stdout == "UTC\n"
+    end
+
+    test "%N is nanoseconds" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15T10:30:00.123456Z' '+%N'")
+      assert result.stdout == "123456000\n"
+    end
+  end
+
+  describe "percent escaping" do
+    test "%%F is a literal percent followed by F" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%%F'")
+      assert result.stdout == "%F\n"
+    end
+
+    test "%%Y is a literal percent followed by Y" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%%Y'")
+      assert result.stdout == "%Y\n"
+    end
+
+    test "a trailing bare percent survives" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+abc%'")
+      assert result.stdout == "abc%\n"
+    end
+
+    test "an unknown specifier is passed through rather than silently dropped" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%J'")
+      assert result.stdout == "%J\n"
+    end
+
+    # Format strings are raw binaries, not necessarily valid UTF-8.
+    test "a raw non-UTF-8 byte in the format passes through" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, ~S|date -d '2024-06-15 00:00:00' +$'\xff%Y'|)
+      assert result.exit_code == 0
+      assert result.stdout == <<0xFF>> <> "2024\n"
+    end
+  end
+
+  describe "-I / --iso-8601" do
+    test "-I prints just the date" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -I")
+      assert result.exit_code == 0
+      assert result.stdout == "2024-06-15\n"
+    end
+
+    test "--iso-8601 is the long form" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' --iso-8601")
+      assert result.stdout == "2024-06-15\n"
+    end
+
+    test "-Iseconds includes the time and offset" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -Iseconds")
+      assert result.stdout == "2024-06-15T10:30:00+00:00\n"
+    end
+
+    test "-Ihours and -Iminutes truncate the time" do
+      bash = JustBash.new()
+      {r1, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:05' -Ihours")
+      {r2, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:05' -Iminutes")
+      assert r1.stdout == "2024-06-15T10+00:00\n"
+      assert r2.stdout == "2024-06-15T10:30+00:00\n"
+    end
+
+    test "-Idate is the same as bare -I" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -Idate")
+      assert result.stdout == "2024-06-15\n"
+    end
+
+    test "--iso-8601=seconds is the long form with a value" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' --iso-8601=seconds")
+      assert result.stdout == "2024-06-15T10:30:00+00:00\n"
+    end
+
+    test "-Ins includes the actual nanoseconds" do
+      bash = JustBash.new()
+      {r1, _} = JustBash.exec(bash, "date -d '2024-06-15T10:30:00.123456Z' -Ins")
+      {r2, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -Ins")
+      assert r1.stdout == "2024-06-15T10:30:00,123456000+00:00\n"
+      assert r2.stdout == "2024-06-15T10:30:00,000000000+00:00\n"
+    end
+
+    # Real date rejects competing output formats rather than picking one,
+    # in either argument order.
+    test "-I together with an explicit +format is an error" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' -I '+%Y'")
+      assert result.exit_code == 1
+      assert result.stderr =~ "multiple output formats specified"
+    end
+
+    test "+format followed by -I is also an error" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 10:30:00' '+%Y' -I")
+      assert result.exit_code == 1
+      assert result.stderr =~ "multiple output formats specified"
+    end
+
+    test "an invalid -I argument is an error" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -Ibogus")
+      assert result.exit_code == 1
+      assert result.stderr =~ "invalid argument 'bogus' for '--iso-8601'"
+    end
+
+    test "date,ns is rejected as real date rejects it" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date --iso-8601=date,ns")
+      assert result.exit_code == 1
+      assert result.stderr =~ "invalid argument 'date,ns' for '--iso-8601'"
+    end
+  end
+
   describe "seq command" do
     test "seq generates sequence" do
       bash = JustBash.new()

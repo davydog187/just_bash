@@ -1,5 +1,22 @@
 defmodule JustBash.Commands.Date do
-  @moduledoc "The `date` command - display the current date and time."
+  @moduledoc """
+  The `date` command — display the current date and time.
+
+  Output is always UTC. Supported directives:
+
+    * compound — `%F` (`%Y-%m-%d`), `%T` (`%H:%M:%S`), `%R` (`%H:%M`),
+      `%D` (`%m/%d/%y`)
+    * date — `%Y`, `%y`, `%C`, `%m`, `%d`, `%e` (space-padded), `%j`,
+      `%a`, `%A`, `%b`, `%h`, `%B`, `%u`, `%w`
+    * time — `%H`, `%M`, `%S`, `%N`, `%I`, `%p`, `%P`, `%Z`, `%s`
+    * literal — `%%`, `%n`, `%t`
+
+  An unrecognized directive is emitted verbatim (`%J` → `%J`), as GNU date does,
+  so a caller can tell the difference between "not supported" and a real value.
+
+  Flags: `-d` / `--date=`, `-I[FMT]` / `--iso-8601[=FMT]`, `-u`, and the BSD
+  `-j` / `-f` pair.
+  """
   @behaviour JustBash.Commands.Command
 
   alias JustBash.Commands.Command
@@ -14,7 +31,7 @@ defmodule JustBash.Commands.Date do
     case parse_args(args) do
       {:ok, opts} ->
         datetime = opts.datetime || DateTime.utc_now()
-        format = opts.format || @default_format
+        format = opts.format || opts.iso_format || @default_format
         output = format_datetime(datetime, format) <> "\n"
         {Command.ok(output), bash}
 
@@ -24,14 +41,30 @@ defmodule JustBash.Commands.Date do
   end
 
   defp parse_args(args) do
-    parse_args(args, %{format: nil, datetime: nil, input_format: nil, no_set: false})
+    parse_args(args, %{
+      format: nil,
+      iso_format: nil,
+      datetime: nil,
+      input_format: nil,
+      no_set: false
+    })
   end
 
   defp parse_args([], opts), do: {:ok, opts}
 
+  # Real date rejects competing output formats rather than picking one.
+  defp parse_args(["+" <> _format | _rest], %{iso_format: iso}) when iso != nil do
+    {:error, "date: multiple output formats specified\n"}
+  end
+
   defp parse_args(["+" <> format | rest], opts) do
     parse_args(rest, %{opts | format: format})
   end
+
+  defp parse_args(["-I" <> spec | rest], opts), do: put_iso_format(spec, rest, opts)
+  defp parse_args(["--iso-8601" | rest], opts), do: put_iso_format("", rest, opts)
+
+  defp parse_args(["--iso-8601=" <> spec | rest], opts), do: put_iso_format(spec, rest, opts)
 
   defp parse_args(["-d", date_str | rest], opts) do
     case parse_date_string(date_str) do
@@ -76,6 +109,24 @@ defmodule JustBash.Commands.Date do
   defp parse_args([_arg | rest], opts) do
     parse_args(rest, opts)
   end
+
+  defp put_iso_format(_spec, _rest, %{format: format}) when format != nil do
+    {:error, "date: multiple output formats specified\n"}
+  end
+
+  defp put_iso_format(spec, rest, opts) do
+    case iso_format(spec) do
+      {:ok, format} -> parse_args(rest, %{opts | iso_format: format})
+      :error -> {:error, "date: invalid argument '#{spec}' for '--iso-8601'\n"}
+    end
+  end
+
+  defp iso_format(spec) when spec in ["", "date"], do: {:ok, "%Y-%m-%d"}
+  defp iso_format("hours"), do: {:ok, "%Y-%m-%dT%H+00:00"}
+  defp iso_format("minutes"), do: {:ok, "%Y-%m-%dT%H:%M+00:00"}
+  defp iso_format("seconds"), do: {:ok, "%Y-%m-%dT%H:%M:%S+00:00"}
+  defp iso_format("ns"), do: {:ok, "%Y-%m-%dT%H:%M:%S,%N+00:00"}
+  defp iso_format(_spec), do: :error
 
   defp parse_formatted_date(date_str, format) do
     cond do
@@ -128,26 +179,74 @@ defmodule JustBash.Commands.Date do
 
   defp parse_relative_date(_), do: {:error, :invalid_format}
 
-  defp format_datetime(datetime, format) do
-    format
-    |> String.replace("%Y", Integer.to_string(datetime.year) |> String.pad_leading(4, "0"))
-    |> String.replace("%m", Integer.to_string(datetime.month) |> String.pad_leading(2, "0"))
-    |> String.replace("%d", Integer.to_string(datetime.day) |> String.pad_leading(2, "0"))
-    |> String.replace("%H", Integer.to_string(datetime.hour) |> String.pad_leading(2, "0"))
-    |> String.replace("%M", Integer.to_string(datetime.minute) |> String.pad_leading(2, "0"))
-    |> String.replace("%S", Integer.to_string(datetime.second) |> String.pad_leading(2, "0"))
-    |> String.replace("%s", Integer.to_string(DateTime.to_unix(datetime)))
-    |> String.replace("%a", short_day_name(datetime))
-    |> String.replace("%A", full_day_name(datetime))
-    |> String.replace("%b", short_month_name(datetime))
-    |> String.replace("%B", full_month_name(datetime))
-    |> String.replace("%j", day_of_year(datetime))
-    |> String.replace("%u", Integer.to_string(Date.day_of_week(datetime)))
-    |> String.replace("%w", Integer.to_string(rem(Date.day_of_week(datetime), 7)))
-    |> String.replace("%n", "\n")
-    |> String.replace("%t", "\t")
-    |> String.replace("%%", "%")
+  # A single left-to-right scan consumes each directive exactly once, so `%%`
+  # escaping works — chained String.replace/3 cannot express it (`%%Y` became
+  # `%2024`). Unknown directives pass through verbatim (`%J` -> `%J`), matching
+  # GNU date. The scan is byte-wise, not codepoint-wise: format strings are raw
+  # binaries and need not be valid UTF-8; every known directive is ASCII, and
+  # passthrough reconstructs other bytes verbatim either way.
+  defp format_datetime(datetime, format), do: scan(format, datetime, [])
+
+  defp scan(<<>>, _datetime, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  # A trailing bare `%` is literal, as in real date.
+  defp scan(<<?%>>, datetime, acc), do: scan(<<>>, datetime, ["%" | acc])
+
+  defp scan(<<?%, directive, rest::binary>>, datetime, acc) do
+    scan(rest, datetime, [directive(directive, datetime) | acc])
   end
+
+  defp scan(<<char, rest::binary>>, datetime, acc) do
+    scan(rest, datetime, [<<char>> | acc])
+  end
+
+  # Compound directives are composed from their single-field parts so the two
+  # can't drift.
+  defp directive(?F, dt), do: "#{directive(?Y, dt)}-#{directive(?m, dt)}-#{directive(?d, dt)}"
+  defp directive(?T, dt), do: "#{directive(?H, dt)}:#{directive(?M, dt)}:#{directive(?S, dt)}"
+  defp directive(?R, dt), do: "#{directive(?H, dt)}:#{directive(?M, dt)}"
+  defp directive(?D, dt), do: "#{directive(?m, dt)}/#{directive(?d, dt)}/#{directive(?y, dt)}"
+
+  defp directive(?Y, dt), do: dt.year |> Integer.to_string() |> String.pad_leading(4, "0")
+  defp directive(?m, dt), do: pad2(dt.month)
+  defp directive(?d, dt), do: pad2(dt.day)
+  defp directive(?H, dt), do: pad2(dt.hour)
+  defp directive(?M, dt), do: pad2(dt.minute)
+  defp directive(?S, dt), do: pad2(dt.second)
+  defp directive(?y, dt), do: dt.year |> rem(100) |> pad2()
+  defp directive(?C, dt), do: dt.year |> div(100) |> pad2()
+  # `%e` is space-padded rather than zero-padded — the one directive where the
+  # difference is visible in column-aligned output.
+  defp directive(?e, dt), do: dt.day |> Integer.to_string() |> String.pad_leading(2, " ")
+  defp directive(?I, dt), do: dt.hour |> twelve_hour() |> pad2()
+  defp directive(?p, dt), do: if(dt.hour < 12, do: "AM", else: "PM")
+  defp directive(?P, dt), do: ?p |> directive(dt) |> String.downcase()
+  defp directive(?Z, dt), do: dt.zone_abbr
+
+  defp directive(?N, dt) do
+    {microsecond, _precision} = dt.microsecond
+    (microsecond * 1_000) |> Integer.to_string() |> String.pad_leading(9, "0")
+  end
+
+  defp directive(?s, dt), do: Integer.to_string(DateTime.to_unix(dt))
+  defp directive(?a, dt), do: short_day_name(dt)
+  defp directive(?A, dt), do: full_day_name(dt)
+  defp directive(?b, dt), do: short_month_name(dt)
+  defp directive(?h, dt), do: short_month_name(dt)
+  defp directive(?B, dt), do: full_month_name(dt)
+  defp directive(?j, dt), do: day_of_year(dt)
+  defp directive(?u, dt), do: Integer.to_string(Date.day_of_week(dt))
+  defp directive(?w, dt), do: Integer.to_string(rem(Date.day_of_week(dt), 7))
+  defp directive(?n, _dt), do: "\n"
+  defp directive(?t, _dt), do: "\t"
+  defp directive(?%, _dt), do: "%"
+  defp directive(other, _dt), do: <<?%, other>>
+
+  defp pad2(n), do: n |> Integer.to_string() |> String.pad_leading(2, "0")
+
+  defp twelve_hour(0), do: 12
+  defp twelve_hour(hour) when hour > 12, do: hour - 12
+  defp twelve_hour(hour), do: hour
 
   defp short_day_name(dt) do
     case Date.day_of_week(dt) do
