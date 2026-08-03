@@ -220,7 +220,7 @@ defmodule JustBash.Commands.Date do
   defp directive(?e, dt), do: dt.day |> Integer.to_string() |> String.pad_leading(2, " ")
   defp directive(?I, dt), do: dt.hour |> twelve_hour() |> pad2()
   defp directive(?p, dt), do: if(dt.hour < 12, do: "AM", else: "PM")
-  defp directive(?P, dt), do: dt |> directive(?p) |> String.downcase()
+  defp directive(?P, dt), do: ?p |> directive(dt) |> String.downcase()
   defp directive(?Z, dt), do: dt.zone_abbr
 
   defp directive(?N, dt) do

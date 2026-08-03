@@ -375,6 +375,44 @@ defmodule JustBash.PropertyTest do
     end
   end
 
+  describe "date format properties" do
+    # Every printable ASCII byte is a candidate directive: known ones render a
+    # field, the rest pass through verbatim. Neither outcome may raise out of
+    # exec/2, so a caller cannot be crashed by a format string. `'` is excluded
+    # because it would terminate the single-quoted format on the command line.
+    @directive_bytes Enum.to_list(33..126) -- [?']
+
+    property "every single-byte directive formats without raising" do
+      check all(byte <- member_of(@directive_bytes)) do
+        bash = JustBash.new()
+        {result, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+%#{<<byte>>}'")
+
+        assert result.exit_code == 0
+        assert result.stdout != "\n"
+      end
+    end
+
+    # The scan consumes each directive exactly once, so a sequence of them is
+    # the concatenation of its parts — no directive may consume, drop, or
+    # rewrite a neighbour's bytes.
+    property "a sequence of directives is the concatenation of each alone" do
+      check all(bytes <- list_of(member_of(@directive_bytes), min_length: 1, max_length: 8)) do
+        bash = JustBash.new()
+        format = Enum.map_join(bytes, fn byte -> "%#{<<byte>>}" end)
+        {result, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+#{format}'")
+
+        expected =
+          Enum.map_join(bytes, fn byte ->
+            {one, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+%#{<<byte>>}'")
+            # Only the newline `date` itself appends — `%n` renders one too.
+            String.replace_suffix(one.stdout, "\n", "")
+          end)
+
+        assert result.stdout == expected <> "\n"
+      end
+    end
+  end
+
   describe "file operations properties" do
     property "touch creates file that exists" do
       check all(name <- string(:alphanumeric, min_length: 1, max_length: 20)) do

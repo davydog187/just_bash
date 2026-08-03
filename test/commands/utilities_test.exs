@@ -344,6 +344,18 @@ defmodule JustBash.Commands.UtilitiesTest do
       assert result.stdout == "12 AM\n"
     end
 
+    test "%P is the lowercase %p" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 13:30:00' '+%P'")
+      assert result.stdout == "pm\n"
+    end
+
+    test "%P renders midnight as am" do
+      bash = JustBash.new()
+      {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:30:00' '+%P'")
+      assert result.stdout == "am\n"
+    end
+
     test "%Z is the timezone name" do
       bash = JustBash.new()
       {result, _} = JustBash.exec(bash, "date -d '2024-06-15 00:00:00' '+%Z'")
