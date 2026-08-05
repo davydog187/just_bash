@@ -14,8 +14,23 @@ defmodule JustBash.Commands.Date do
   An unrecognized directive is emitted verbatim (`%J` → `%J`), as GNU date does,
   so a caller can tell the difference between "not supported" and a real value.
 
-  Flags: `-d` / `--date=`, `-I[FMT]` / `--iso-8601[=FMT]`, `-u`, and the BSD
-  `-j` / `-f` pair.
+  Flags: `-d` / `--date=`, `-I[FMT]` / `--iso-8601[=FMT]`, `-u`, `-r SECONDS`,
+  the BSD `-v` adjustments, and the BSD `-j` / `-f` pair. Values may be attached
+  or separate (`-d2024-06-15`), no-argument flags may cluster (`-ju`), and `--`
+  ends option parsing — the getopt conventions real date inherits.
+
+  Everything else is an error. An unimplemented flag must not be dropped:
+  ignoring it would print the current date at exit 0, which a caller cannot
+  tell apart from a real answer.
+
+  Errors follow whichever real implementation spells the flag: GNU's wording for
+  a long option (`unrecognized option '--foo'`), BSD's for a short one
+  (`illegal option -- X`), since BSD names a long option by its second `-` and
+  so identifies nothing.
+
+  Two BSD features are deliberately partial, and say so rather than guessing:
+  `-v` implements only the relative form (`[+-]val[ymwdHMS]`), not the
+  set-a-field form (`-v1d`, `-vfri`); `-r` takes epoch seconds, not a filename.
   """
   @behaviour JustBash.Commands.Command
 
@@ -23,20 +38,44 @@ defmodule JustBash.Commands.Date do
 
   @default_format "%a %b %d %H:%M:%S UTC %Y"
 
+  # `-v[+-]val[unit]`. The sign is what distinguishes an adjustment from BSD's
+  # set-this-field form, which we do not implement.
+  @adjustment ~r/^([+-])(\d+)([ymwdHMS])$/
+
+  # Real date's operand is a time to set the system clock to. There is no clock
+  # to set here, and an unprivileged real date fails on it too.
+  @settable_time ~r/^(\d{2}){2,6}(\.\d{2})?$/
+
+  # Short flags that take no value, and so may cluster: `-ju` is `-j -u`.
+  @no_argument_flags [?j, ?u]
+
+  # The ISO calendar spans fewer than 3.7M days, so no adjustment larger than
+  # that lands inside it from any base.
+  @max_seconds 3_652_425 * 86_400
+
+  # Seconds per unit, each rounded down to the shortest that unit can be, so the
+  # bound above never rejects an adjustment that would have been in range.
+  @unit_seconds %{
+    "y" => 365 * 86_400,
+    "m" => 28 * 86_400,
+    "w" => 7 * 86_400,
+    "d" => 86_400,
+    "H" => 3_600,
+    "M" => 60,
+    "S" => 1
+  }
+
   @impl true
   def names, do: ["date"]
 
   @impl true
   def execute(bash, args, _stdin) do
-    case parse_args(args) do
-      {:ok, opts} ->
-        datetime = opts.datetime || DateTime.utc_now()
-        format = opts.format || opts.iso_format || @default_format
-        output = format_datetime(datetime, format) <> "\n"
-        {Command.ok(output), bash}
-
-      {:error, msg} ->
-        {Command.error(msg), bash}
+    with {:ok, opts} <- parse_args(args),
+         {:ok, datetime} <- adjust(opts.datetime || DateTime.utc_now(), opts.adjustments) do
+      format = opts.format || opts.iso_format || @default_format
+      {Command.ok(format_datetime(datetime, format) <> "\n"), bash}
+    else
+      {:error, msg} -> {Command.error(msg), bash}
     end
   end
 
@@ -46,39 +85,36 @@ defmodule JustBash.Commands.Date do
       iso_format: nil,
       datetime: nil,
       input_format: nil,
+      adjustments: [],
       no_set: false
     })
   end
 
-  defp parse_args([], opts), do: {:ok, opts}
+  defp parse_args([], opts), do: finish(opts)
 
-  # Real date rejects competing output formats rather than picking one.
-  defp parse_args(["+" <> _format | _rest], %{iso_format: iso}) when iso != nil do
-    {:error, "date: multiple output formats specified\n"}
-  end
-
-  defp parse_args(["+" <> format | rest], opts) do
-    parse_args(rest, %{opts | format: format})
-  end
+  defp parse_args(["+" <> format | rest], opts),
+    do: put_format(format, rest, opts, &parse_args/2)
 
   defp parse_args(["-I" <> spec | rest], opts), do: put_iso_format(spec, rest, opts)
   defp parse_args(["--iso-8601" | rest], opts), do: put_iso_format("", rest, opts)
 
   defp parse_args(["--iso-8601=" <> spec | rest], opts), do: put_iso_format(spec, rest, opts)
 
-  defp parse_args(["-d", date_str | rest], opts) do
-    case parse_date_string(date_str) do
-      {:ok, datetime} -> parse_args(rest, %{opts | datetime: datetime})
-      {:error, _} -> {:error, "date: invalid date '#{date_str}'\n"}
-    end
-  end
+  # A flag's value may be attached (-d2024-01-01) or separate, as getopt allows.
+  defp parse_args(["-d"], _opts), do: {:error, missing_argument("-d")}
+  defp parse_args(["-d", date_str | rest], opts), do: put_datetime(date_str, rest, opts)
+  defp parse_args(["-d" <> date_str | rest], opts), do: put_datetime(date_str, rest, opts)
+  defp parse_args(["--date=" <> date_str | rest], opts), do: put_datetime(date_str, rest, opts)
 
-  defp parse_args(["--date=" <> date_str | rest], opts) do
-    case parse_date_string(date_str) do
-      {:ok, datetime} -> parse_args(rest, %{opts | datetime: datetime})
-      {:error, _} -> {:error, "date: invalid date '#{date_str}'\n"}
-    end
-  end
+  # BSD date: -r takes the time from an epoch timestamp.
+  defp parse_args(["-r"], _opts), do: {:error, missing_argument("-r")}
+  defp parse_args(["-r", secs | rest], opts), do: put_epoch(secs, rest, opts)
+  defp parse_args(["-r" <> secs | rest], opts), do: put_epoch(secs, rest, opts)
+
+  # BSD date: -v adjusts a field of the date, as many times as given.
+  defp parse_args(["-v"], _opts), do: {:error, missing_argument("-v")}
+  defp parse_args(["-v", spec | rest], opts), do: put_adjustment(spec, rest, opts)
+  defp parse_args(["-v" <> spec | rest], opts), do: put_adjustment(spec, rest, opts)
 
   # BSD date: -j flag means "don't set the date" (just display)
   defp parse_args(["-j" | rest], opts) do
@@ -86,6 +122,8 @@ defmodule JustBash.Commands.Date do
   end
 
   # BSD date: -f input_format to parse a date string
+  defp parse_args(["-f"], _opts), do: {:error, missing_argument("-f")}
+
   defp parse_args(["-f", input_format | rest], opts) do
     parse_args(rest, %{opts | input_format: input_format})
   end
@@ -94,20 +132,190 @@ defmodule JustBash.Commands.Date do
     parse_args(rest, opts)
   end
 
+  # Inside a cluster the next character is an option character, and `-` is not
+  # one. This clause has to precede the rewrite below, which would otherwise read
+  # `-u-` as `-u --` and print the date at exit 0.
+  defp parse_args([<<?-, flag, ?-, _::binary>> | _rest], _opts)
+       when flag in @no_argument_flags do
+    {:error, "date: illegal option -- -\n" <> usage()}
+  end
+
+  # getopt lets no-argument flags cluster, and lets whichever flag ends a cluster
+  # carry its value attached: `-ur0` is `-u -r 0`.
+  defp parse_args([<<?-, flag, rest::binary>> | args], opts)
+       when flag in @no_argument_flags and rest != "" do
+    parse_args([<<?-, flag>>, "-" <> rest | args], opts)
+  end
+
   # When we have an input_format set (BSD -f flag) and encounter a non-option arg
   defp parse_args([<<c, _::binary>> = date_str | rest], %{input_format: input_format} = opts)
        when input_format != nil and c != ?+ and c != ?- do
-    case parse_formatted_date(date_str, input_format) do
-      {:ok, datetime} ->
-        parse_args(rest, %{opts | datetime: datetime, input_format: nil})
+    put_formatted_date(date_str, rest, opts, &parse_args/2)
+  end
 
-      {:error, _} ->
-        {:error, "date: invalid date '#{date_str}'\n"}
+  # `--` ends option parsing, as getopt does.
+  defp parse_args(["--" | rest], opts), do: parse_operands(rest, opts)
+
+  # An option we do not implement fails loudly. Dropping it would print the
+  # current date at exit 0 — a wrong answer nothing downstream can detect.
+  defp parse_args(["--" <> flag | _rest], _opts) when flag != "" do
+    {:error, "date: unrecognized option '--#{flag}'\n" <> usage()}
+  end
+
+  # A short option is named by the character getopt rejected, so `-Xu` is a bad
+  # `X` rather than a bad `Xu`. A lone `-` has no such character and falls
+  # through to the operand clause below, which is where getopt leaves it too.
+  defp parse_args([<<?-, char, _::binary>> | _rest], _opts) do
+    {:error, "date: illegal option -- #{<<char>>}\n" <> usage()}
+  end
+
+  defp parse_args([operand | _rest], opts), do: operand_error(operand, opts)
+
+  # After `--` nothing is an option, so an argument is `+format`, the operand a
+  # pending -f describes, or a time we are being asked to set the clock to.
+  defp parse_operands([], opts), do: finish(opts)
+
+  defp parse_operands(["+" <> format | rest], opts),
+    do: put_format(format, rest, opts, &parse_operands/2)
+
+  defp parse_operands([date_str | rest], %{input_format: input_format} = opts)
+       when input_format != nil do
+    put_formatted_date(date_str, rest, opts, &parse_operands/2)
+  end
+
+  defp parse_operands([operand | _rest], opts), do: operand_error(operand, opts)
+
+  # -f names the format of an operand. With no operand there is nothing to parse,
+  # and real date prints usage rather than falling back to the current time.
+  defp finish(%{input_format: input_format}) when input_format != nil, do: {:error, usage()}
+  defp finish(opts), do: {:ok, opts}
+
+  # With -j there is no clock to set, so an operand is a time to display — and
+  # the canonical `[[[[mm]dd]HH]MM[[cc]yy][.SS]` form is one we cannot parse.
+  defp operand_error(_operand, %{no_set: true}), do: {:error, illegal_time_format()}
+
+  defp operand_error(operand, _opts) do
+    if Regex.match?(@settable_time, operand) do
+      {:error, "date: clock_settime: Operation not permitted\n"}
+    else
+      {:error, illegal_time_format()}
     end
   end
 
-  defp parse_args([_arg | rest], opts) do
-    parse_args(rest, opts)
+  # Real date rejects competing output formats rather than picking one.
+  defp put_format(_format, _rest, %{iso_format: iso}, _cont) when iso != nil,
+    do: {:error, "date: multiple output formats specified\n"}
+
+  defp put_format(format, rest, opts, cont), do: cont.(rest, %{opts | format: format})
+
+  defp put_formatted_date(date_str, rest, %{input_format: input_format} = opts, cont) do
+    case parse_formatted_date(date_str, input_format) do
+      {:ok, datetime} -> cont.(rest, %{opts | datetime: datetime, input_format: nil})
+      {:error, _} -> {:error, "date: invalid date '#{date_str}'\n"}
+    end
+  end
+
+  defp put_datetime(date_str, rest, opts) do
+    case parse_date_string(date_str) do
+      {:ok, datetime} -> parse_args(rest, %{opts | datetime: datetime})
+      {:error, _} -> {:error, "date: invalid date '#{date_str}'\n"}
+    end
+  end
+
+  defp put_epoch(secs, rest, opts) do
+    with {seconds, ""} <- Integer.parse(secs),
+         {:ok, datetime} <- DateTime.from_unix(seconds) do
+      parse_args(rest, %{opts | datetime: datetime})
+    else
+      {:error, :invalid_unix_time} -> {:error, "date: invalid time\n"}
+      _not_a_number -> {:error, "date: illegal time value -- #{secs}\n" <> usage()}
+    end
+  end
+
+  defp put_adjustment(spec, rest, opts) do
+    case parse_adjustment(spec) do
+      {:ok, adjustment} ->
+        parse_args(rest, %{opts | adjustments: [adjustment | opts.adjustments]})
+
+      :error ->
+        {:error, cannot_adjust(spec)}
+    end
+  end
+
+  # An adjustment too large for the ISO calendar is rejected here, before it is
+  # applied, and not by the range check in adjust/2 afterwards. That is not just
+  # an early exit: a fixed-length unit is applied with DateTime.add/3, whose cost
+  # grows with how far the result lands from the epoch, so a spec like
+  # `+99999999999999999999d` does not come back at all.
+  defp parse_adjustment(spec) do
+    with [_spec, sign, value, unit] <- Regex.run(@adjustment, spec),
+         amount = String.to_integer(sign <> value),
+         true <- abs(amount) * Map.fetch!(@unit_seconds, unit) <= @max_seconds do
+      {:ok, {amount, unit, spec}}
+    else
+      _unparseable_or_too_large -> :error
+    end
+  end
+
+  defp cannot_adjust(spec), do: "date: #{spec}: Cannot apply date adjustment\n" <> usage()
+
+  defp missing_argument(flag), do: "date: option requires an argument -- #{flag}\n" <> usage()
+
+  defp illegal_time_format, do: "date: illegal time format\n" <> usage()
+
+  defp usage do
+    """
+    usage: date [-u] [-d datestr | -r seconds] [-j] [-f input_fmt]
+                [-I[date|hours|minutes|seconds|ns]] [-v[+|-]val[y|m|w|d|H|M|S]]
+                [+output_fmt]
+    """
+  end
+
+  # Adjustments are applied in the order given, each to the result of the last,
+  # which is how BSD composes `-v+1m -v-1d`. An adjustment that lands outside the
+  # ISO calendar is rejected rather than printed: `%Y` is four digits and `-d`
+  # only parses ISO dates, so a year like -97973 is not an answer.
+  defp adjust(datetime, adjustments) do
+    adjustments
+    |> Enum.reverse()
+    |> Enum.reduce_while({:ok, datetime}, fn {_n, _unit, spec} = adjustment, {:ok, dt} ->
+      case apply_adjustment(dt, adjustment) do
+        %DateTime{year: year} = adjusted when year in 0..9999 -> {:cont, {:ok, adjusted}}
+        %DateTime{} -> {:halt, {:error, cannot_adjust(spec)}}
+      end
+    end)
+  end
+
+  defp apply_adjustment(dt, {n, "y", _spec}), do: shift_years(dt, n)
+  defp apply_adjustment(dt, {n, "m", _spec}), do: shift_months(dt, n)
+  defp apply_adjustment(dt, {n, "w", _spec}), do: DateTime.add(dt, n * 7, :day)
+  defp apply_adjustment(dt, {n, "d", _spec}), do: DateTime.add(dt, n, :day)
+  defp apply_adjustment(dt, {n, "H", _spec}), do: DateTime.add(dt, n, :hour)
+  defp apply_adjustment(dt, {n, "M", _spec}), do: DateTime.add(dt, n, :minute)
+  defp apply_adjustment(dt, {n, "S", _spec}), do: DateTime.add(dt, n, :second)
+
+  # A year adjustment moves the year field and lets an impossible result
+  # normalize forward: Feb 29 plus a year is Mar 1. BSD really does differ here
+  # from the month adjustment below, which clamps instead — `-v+1y` off Feb 29
+  # gives Mar 1 where `-v+12m` gives Feb 28.
+  defp shift_years(dt, n) do
+    year = dt.year + n
+    days = Calendar.ISO.days_in_month(year, dt.month)
+
+    case dt.day - days do
+      overflow when overflow > 0 -> shift_months(%{dt | year: year, day: overflow}, 1)
+      _fits -> %{dt | year: year}
+    end
+  end
+
+  # Months are a variable-length unit, so BSD preserves the day of the month and
+  # clamps to the target month's last day when it doesn't exist there: May 31
+  # plus a month is June 30.
+  defp shift_months(dt, n) do
+    total = dt.year * 12 + (dt.month - 1) + n
+    year = Integer.floor_div(total, 12)
+    month = Integer.mod(total, 12) + 1
+    %{dt | year: year, month: month, day: min(dt.day, Calendar.ISO.days_in_month(year, month))}
   end
 
   defp put_iso_format(_spec, _rest, %{format: format}) when format != nil do
