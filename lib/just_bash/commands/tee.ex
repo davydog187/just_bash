@@ -59,15 +59,32 @@ defmodule JustBash.Commands.Tee do
         {acc_fs, acc_stderr, acc_code}
       else
         resolved = FS.resolve_path(cwd, file)
-        write_single_file(acc_fs, resolved, file, content, append, acc_stderr, acc_code)
+        write_single_file(acc_fs, {cwd, resolved}, file, content, append, acc_stderr, acc_code)
       end
     end)
+  end
+
+  # POSIX reads the trailing slash in `tee f/` as an assertion that `f` is a
+  # directory, and `FS.resolve_path/2` normalizes it away — so a file spelled
+  # that way is checked against what is really there before anything is
+  # written. Checked against GNU coreutils 9.11:
+  #
+  #     $ echo x | tee f/     tee: f/: Not a directory
+  #     $ echo x | tee nope/  tee: nope/: No such file or directory
+  defp write_single_file(fs, {cwd, resolved}, file, content, append, acc_stderr, acc_code) do
+    case FS.check_directory_spelling(fs, cwd, file) do
+      {:ok, fs} ->
+        write_below_parent(fs, resolved, file, content, append, acc_stderr, acc_code)
+
+      {:error, %VFS.Error{} = error} ->
+        {fs, acc_stderr <> "tee: #{file}: #{FS.strerror(error)}\n", 1}
+    end
   end
 
   # tee does not create missing parent directories, so an absent parent is
   # reported instead of being conjured up; a parent that exists but is not
   # a directory is ENOTDIR, as the kernel would report it.
-  defp write_single_file(fs, resolved, file, content, append, acc_stderr, acc_code) do
+  defp write_below_parent(fs, resolved, file, content, append, acc_stderr, acc_code) do
     parent = Path.dirname(resolved)
 
     case FS.stat(fs, parent) do

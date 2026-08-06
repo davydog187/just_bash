@@ -115,12 +115,12 @@ defmodule JustBash.Interpreter.Executor.Redirection do
     redir_type = classify_redirection(fd, operator, target_path)
     resolved = FS.resolve_path(bash.cwd, target_path)
 
-    case open_target(bash, redir_type, resolved) do
+    case open_target(bash, redir_type, target_path, resolved) do
       {:ok, bash} ->
         do_preflight(bash, rest, [{redir_type, resolved} | prepared])
 
-      {:error, error, bash} ->
-        {:error, open_failed(resolved, error), bash}
+      {:error, path, error, bash} ->
+        {:error, open_failed(path, error), bash}
     end
   end
 
@@ -130,13 +130,55 @@ defmodule JustBash.Interpreter.Executor.Redirection do
     %{stdout: "", stderr: "bash: #{path}: #{FS.strerror(error)}\n", exit_code: 1}
   end
 
-  defp open_target(bash, redir_type, path) do
+  defp open_target(bash, redir_type, target_path, resolved) do
     case open_mode(redir_type) do
-      :truncate -> create_or_truncate(bash, path)
-      :append -> open_for_append(bash, path)
       :none -> {:ok, bash}
+      mode -> open_file(bash, mode, target_path, resolved)
     end
   end
+
+  # A redirection writes a file, never a directory, so a target spelled as one
+  # — POSIX reads the trailing slash in `> f/` as an assertion that `f` is a
+  # directory — cannot be opened whatever is there. `resolve_path/2`
+  # normalizes the slash away, so the check needs the target as it was
+  # written, which is also how bash names it. Checked against bash 5:
+  #
+  #     $ echo hi > f/     bash: f/: Not a directory
+  #     $ echo hi > d/     bash: d/: Is a directory
+  #     $ echo hi > nope/  bash: nope/: No such file or directory
+  #
+  # An empty target names nothing at all — `open("")` is ENOENT, not a write
+  # to the working directory that resolving it would produce:
+  #
+  #     $ echo hi > ''     bash: : No such file or directory
+  defp open_file(bash, _mode, "" = target_path, _resolved),
+    do: {:error, target_path, VFS.Error.new(:enoent, path: target_path), bash}
+
+  defp open_file(bash, mode, target_path, resolved) do
+    if FS.directory_spelling?(target_path) do
+      {:error, target_path, directory_target(bash, target_path, resolved), bash}
+    else
+      open_resolved(bash, mode, target_path, resolved)
+    end
+  end
+
+  # A spelling that holds is a directory, which is the one thing a redirection
+  # may not open; a spelling that does not says why it does not.
+  defp directory_target(bash, target_path, resolved) do
+    case FS.check_directory_spelling(bash.fs, bash.cwd, target_path) do
+      {:ok, _fs} -> VFS.Error.new(:eisdir, path: resolved)
+      {:error, %VFS.Error{} = error} -> error
+    end
+  end
+
+  defp open_resolved(bash, :truncate, target_path, resolved),
+    do: opened(create_or_truncate(bash, resolved), target_path)
+
+  defp open_resolved(bash, :append, target_path, resolved),
+    do: opened(open_for_append(bash, resolved), target_path)
+
+  defp opened({:ok, bash}, _target_path), do: {:ok, bash}
+  defp opened({:error, error, bash}, target_path), do: {:error, target_path, error, bash}
 
   @spec open_mode(redir_type()) :: :truncate | :append | :none
   defp open_mode(:stdout_write), do: :truncate
