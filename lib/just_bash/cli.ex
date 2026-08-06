@@ -41,16 +41,30 @@ defmodule JustBash.CLI do
 
   Flag specs use the exact shape of `JustBash.Commands.ArgParser`: a keyword list of
   `name: [type: ..., ...]`. Supported keys: `:type` (`:boolean`, `:string`, `:integer`,
-  `:float`, `:accumulator`), `:short`, `:long` (defaults to `--name`), `:default`,
-  `:required`, `:values` (enum), `:transform`, and `:doc` (used in help output).
+  `:float`, `:accumulator`), `:short`, `:long` (defaults to `--name`), `:aliases`,
+  `:default`, `:required`, `:values` (enum), `:transform`, and `:doc` (used in help output).
 
   Flag specs are validated at build time (`command/2` raises `ArgumentError`):
 
+    * an unrecognized spec key is rejected — a typo'd or imagined key would otherwise be
+      silently ignored and indistinguishable from a working one.
     * `--help`/`-h` are **reserved** — see "Reserved flags" below.
     * `:required` and `:default` are mutually exclusive (a required flag errors when omitted,
       so the default could never apply).
     * a `:default` must be a member of `:values` when both are given (the enum check only
       runs on flags the user actually provides, so an out-of-range default would slip past it).
+    * an alias must start with `--`, and no two flags may share a long form, an alias, or a
+      short form — the parser indexes them into one map, so a collision would silently bind
+      the wrong flag.
+    * a long form or alias may not contain `=` — the parser splits `--flag=value` on the first
+      `=` before matching, so such a spelling could never be reached.
+
+  ## Flag aliases
+
+  `:aliases` gives one flag extra long spellings, for renaming a flag without breaking
+  callers: `target_on: [type: :string, aliases: ["--target-date"]]` accepts both
+  `--target-on` and `--target-date`. `:long` stays canonical and is the only form shown in
+  usage lines, help, and `describe/1` — aliases are accepted, not advertised.
 
   `:values` is compared against the **coerced** value, so list members must match the flag's
   `:type` — e.g. `type: :integer, values: [1, 2]` (integers, not `~w(1 2)`). The raw
@@ -129,6 +143,41 @@ defmodule JustBash.CLI do
   # Exit code used for all usage errors (unknown command, bad flags, missing args),
   # matching the convention of git/most CLIs.
   @usage_exit 2
+
+  # Every key a flag spec may carry — the `JustBash.Commands.ArgParser` shape plus `:doc`.
+  # Anything else is rejected at build time (see `validate_flag_spec!/3`).
+  @flag_spec_keys [
+    :type,
+    :short,
+    :long,
+    :aliases,
+    :default,
+    :required,
+    :values,
+    :transform,
+    :doc
+  ]
+
+  # Every option `command/2` reads. Anything else would be dropped unread — including
+  # `visible:` for `:visible?`, which discards an authorization predicate.
+  @command_opt_keys [
+    :doc,
+    :commands,
+    :run,
+    :flags,
+    :args,
+    :examples,
+    :validate,
+    :allow_unknown_flags,
+    :visible?,
+    :on_missing_subcommand
+  ]
+
+  # Every option `new/2` reads.
+  @cli_opt_keys [:doc, :commands, :aliases, :on_missing_subcommand]
+
+  # Every key a positional argument spec may carry (see `t:JustBash.CLI.Command.arg_spec/0`).
+  @arg_spec_keys [:name, :doc, :required, :variadic]
 
   @enforce_keys [:name]
   defstruct name: nil, doc: nil, commands: [], aliases: [], on_missing_subcommand: :error
@@ -251,11 +300,14 @@ defmodule JustBash.CLI do
     * `:on_missing_subcommand` — `:error` (default) or `:help`; what the root does when
       invoked with no subcommand (see `command/2`)
 
-  Raises `ArgumentError` if names are invalid or top-level command names collide.
+  Raises `ArgumentError` if names are invalid, top-level command names collide, or an
+  option is unrecognized or repeated — an option this function does not read would be
+  dropped unread, indistinguishable from one that works.
   """
   @spec new(String.t(), keyword()) :: t()
   def new(name, opts \\ []) when is_binary(name) do
     validate_name!(name, "CLI")
+    validate_spec_keys!("CLI #{inspect(name)}", "option", Keyword.keys(opts), @cli_opt_keys)
 
     commands = Keyword.get(opts, :commands, [])
     validate_commands!(commands)
@@ -304,11 +356,22 @@ defmodule JustBash.CLI do
     * `:on_missing_subcommand` — `:error` (default) or `:help` (groups only); `:help` prints
       the command listing at exit 0 instead of a usage error when the group is invoked bare
 
-  Raises `ArgumentError` on invalid shape (e.g. both or neither of `:commands`/`:run`).
+  Raises `ArgumentError` on invalid shape (e.g. both or neither of `:commands`/`:run`), and
+  on an unrecognized or repeated option — including inside an `:args` entry. A key this
+  builder does not read would be dropped unread and behave exactly like one that works;
+  `visible:` for `:visible?` would silently discard an authorization predicate, and
+  `requird:` on a positional would silently make a required argument optional.
   """
   @spec command(String.t(), keyword()) :: Command.t()
   def command(name, opts \\ []) when is_binary(name) do
     validate_name!(name, "command")
+
+    validate_spec_keys!(
+      "command #{inspect(name)}",
+      "option",
+      Keyword.keys(opts),
+      @command_opt_keys
+    )
 
     commands = Keyword.get(opts, :commands, [])
     run = Keyword.get(opts, :run)
@@ -873,16 +936,20 @@ defmodule JustBash.CLI do
             "command #{inspect(name)} :flags must be a keyword list of flag specs, got: #{inspect(flags)}"
     end
 
-    Enum.map(flags, fn {flag_name, spec} ->
-      unless Keyword.keyword?(spec) do
-        raise ArgumentError,
-              "command #{inspect(name)} flag #{inspect(flag_name)} spec must be a keyword list, got: #{inspect(spec)}"
-      end
+    flags =
+      Enum.map(flags, fn {flag_name, spec} ->
+        unless Keyword.keyword?(spec) do
+          raise ArgumentError,
+                "command #{inspect(name)} flag #{inspect(flag_name)} spec must be a keyword list, got: #{inspect(spec)}"
+        end
 
-      spec = Keyword.put_new(spec, :long, default_long(flag_name))
-      validate_flag_spec!(name, flag_name, spec)
-      {flag_name, spec}
-    end)
+        spec = Keyword.put_new(spec, :long, default_long(flag_name))
+        validate_flag_spec!(name, flag_name, spec)
+        {flag_name, spec}
+      end)
+
+    validate_flag_collisions!(name, flags)
+    flags
   end
 
   defp normalize_flags!(name, flags) do
@@ -891,6 +958,8 @@ defmodule JustBash.CLI do
   end
 
   # Build-time guards that can't drift into runtime surprises:
+  #   * an unrecognized key is never read by the parser, so a typo (or an imagined feature)
+  #     would behave exactly like a spec that works — until the flag is exercised.
   #   * `--help`/`-h` are intercepted by the router before any leaf parses, so a flag that
   #     claims them could never receive its value (see the "reserved flags" note in the
   #     moduledoc).
@@ -899,6 +968,10 @@ defmodule JustBash.CLI do
   #   * a `:default` outside `:values` would silently bypass the enum check, which only
   #     runs on provided flags.
   defp validate_flag_spec!(name, flag_name, spec) do
+    validate_flag_keys!(name, flag_name, spec)
+    validate_flag_long!(name, flag_name, spec[:long])
+    validate_flag_aliases!(name, flag_name, spec[:aliases])
+
     cond do
       spec[:long] == "--help" or spec[:short] == "-h" ->
         reserved = if spec[:long] == "--help", do: "--help", else: "-h"
@@ -914,6 +987,129 @@ defmodule JustBash.CLI do
         validate_default_in_values!(name, flag_name, spec)
     end
   end
+
+  defp validate_flag_keys!(name, flag_name, spec) do
+    validate_spec_keys!(
+      "command #{inspect(name)} flag #{inspect(flag_name)}",
+      "flag option",
+      Keyword.keys(spec),
+      @flag_spec_keys
+    )
+  end
+
+  # The unknown/duplicate key guard shared by every spec the builder accepts. Both failures
+  # are the same silent drop: an unrecognized key is never read, so a typo (or an imagined
+  # feature) behaves exactly like a key that works, and a duplicated key is dropped by
+  # `Keyword` access, which returns only the first value. `Enum.uniq/1` before the subtraction
+  # matters because list subtraction removes one occurrence per element — without it a legally
+  # duplicated *valid* key survives and gets reported as unknown, in a message that lists it
+  # as valid in the same sentence.
+  defp validate_spec_keys!(context, label, keys, allowed) do
+    unique = Enum.uniq(keys)
+
+    case {unique -- allowed, keys -- unique} do
+      {[], []} ->
+        :ok
+
+      {[unknown | _rest], _duplicates} ->
+        raise ArgumentError,
+              "#{context}: unknown #{label} #{inspect(unknown)}; " <>
+                "valid options are #{inspect(allowed)}"
+
+      {[], [duplicate | _rest]} ->
+        raise ArgumentError, "#{context}: duplicate #{label} #{inspect(duplicate)}"
+    end
+  end
+
+  defp validate_flag_long!(name, flag_name, long) when is_binary(long),
+    do: reject_equals!(name, flag_name, "long form", long)
+
+  defp validate_flag_long!(_name, _flag_name, _long), do: :ok
+
+  # `ArgParser.parse_loop/5` splits a long token on its first `=` (the `--flag=value` form)
+  # before consulting the long-form map, so a spelling containing `=` is registered but can
+  # never be matched: it builds clean and does nothing.
+  defp reject_equals!(name, flag_name, kind, form) do
+    if String.contains?(form, "=") do
+      raise ArgumentError,
+            "command #{inspect(name)} flag #{inspect(flag_name)}: #{kind} #{inspect(form)} " <>
+              "cannot contain \"=\" — the parser splits a long flag on \"=\" before matching it"
+    end
+
+    :ok
+  end
+
+  defp validate_flag_aliases!(_name, _flag_name, nil), do: :ok
+
+  defp validate_flag_aliases!(name, flag_name, aliases) when is_list(aliases) do
+    Enum.each(aliases, &validate_flag_alias!(name, flag_name, &1))
+  end
+
+  defp validate_flag_aliases!(name, flag_name, other) do
+    raise ArgumentError,
+          "command #{inspect(name)} flag #{inspect(flag_name)}: :aliases must be a list of " <>
+            "strings, got: #{inspect(other)}"
+  end
+
+  defp validate_flag_alias!(name, flag_name, form) when is_binary(form) do
+    cond do
+      form == "--help" ->
+        raise ArgumentError,
+              "command #{inspect(name)} flag #{inspect(flag_name)}: alias \"--help\" is reserved " <>
+                "for help and cannot be used as a flag"
+
+      not String.starts_with?(form, "--") or form == "--" ->
+        raise ArgumentError,
+              "command #{inspect(name)} flag #{inspect(flag_name)}: alias #{inspect(form)} must " <>
+                "be a long flag form starting with \"--\""
+
+      true ->
+        reject_equals!(name, flag_name, "alias", form)
+    end
+  end
+
+  defp validate_flag_alias!(name, flag_name, other) do
+    raise ArgumentError,
+          "command #{inspect(name)} flag #{inspect(flag_name)}: :aliases must be a list of " <>
+            "strings, got: #{inspect(other)}"
+  end
+
+  # Two flags claiming the same spelling would resolve to whichever the parser indexed last
+  # (`build_flag_maps/1` is a last-write-wins reduce), silently binding the wrong flag. Every
+  # long form and alias on a command must therefore be distinct from each other, and every
+  # short form distinct from every other short form. Longs go first so a collision between a
+  # long form and an alias is reported against the alias, which is the form that moved.
+  defp validate_flag_collisions!(name, flags) do
+    longs = for {flag_name, spec} <- flags, spec[:long], do: {flag_name, :long, spec[:long]}
+    shorts = for {flag_name, spec} <- flags, spec[:short], do: {flag_name, :short, spec[:short]}
+
+    aliased =
+      for {flag_name, spec} <- flags, form <- spec[:aliases] || [], do: {flag_name, :alias, form}
+
+    do_validate_flag_collisions!(name, longs ++ aliased, [])
+    do_validate_flag_collisions!(name, shorts, [])
+  end
+
+  defp do_validate_flag_collisions!(_name, [], _taken), do: :ok
+
+  defp do_validate_flag_collisions!(name, [{flag_name, kind, form} | rest], taken) do
+    if form in taken do
+      raise ArgumentError,
+            "command #{inspect(name)} flag #{inspect(flag_name)}: " <>
+              collision_message(kind, form)
+    end
+
+    do_validate_flag_collisions!(name, rest, [form | taken])
+  end
+
+  defp collision_message(:long, form),
+    do: "long form #{inspect(form)} collides with an existing flag long form or alias"
+
+  defp collision_message(:alias, form),
+    do: "alias #{inspect(form)} collides with an existing flag long form or alias"
+
+  defp collision_message(:short, form),
+    do: "short form #{inspect(form)} collides with an existing flag short form"
 
   defp validate_default_in_values!(name, flag_name, spec) do
     with {:ok, default} <- Keyword.fetch(spec, :default),
@@ -964,7 +1160,14 @@ defmodule JustBash.CLI do
     raise ArgumentError, "command #{inspect(name)} :args must be a list, got: #{inspect(other)}"
   end
 
-  defp normalize_arg!(_name, %{name: arg_name} = spec) when is_atom(arg_name) do
+  defp normalize_arg!(name, %{name: arg_name} = spec) when is_atom(arg_name) do
+    validate_spec_keys!(
+      "command #{inspect(name)}",
+      "positional argument option",
+      Map.keys(spec),
+      @arg_spec_keys
+    )
+
     %{
       name: arg_name,
       doc: Map.get(spec, :doc),
