@@ -40,9 +40,7 @@ defmodule JustBash.Interpreter.Executor do
         if b.interpreter.halted do
           {:halt, {b, out, err, 1, true}}
         else
-          {result, new_bash} = execute_statement(b, stmt)
-          new_env = Map.put(new_bash.env, "?", to_string(result.exit_code))
-          new_bash = %{new_bash | last_exit_code: result.exit_code, env: new_env}
+          {result, new_bash} = run_statement(b, stmt)
           acc = {new_bash, [out, result.stdout], [err, result.stderr], result.exit_code, false}
 
           if new_bash.shell_opts.errexit and result.exit_code != 0 and
@@ -66,6 +64,59 @@ defmodule JustBash.Interpreter.Executor do
     {result, final_bash}
   end
 
+  # Containment, not defensive coding: `JustBash.exec/2` is a trust boundary and
+  # a raise reaching here is a bug in JustBash, but a host driving the sandbox
+  # has no way to act on an Elixir exception naming a JustBash internal.
+  #
+  # It is contained *here*, in the statement loop, rather than at `exec/2`,
+  # because this is where the last known-good shell lives: the accumulated
+  # output of the statements that already ran, and the struct they left behind.
+  # Rescuing at `exec/2` can only see the parameter, so it silently rolls the
+  # whole session back. The neighbouring `Limit.ExceededError` handler in
+  # `execute_statement/2` already keeps prior work; this matches it.
+  defp run_statement(bash, stmt) do
+    {result, new_bash} = execute_statement(bash, stmt)
+    new_env = Map.put(new_bash.env, "?", to_string(result.exit_code))
+    {result, %{new_bash | last_exit_code: result.exit_code, env: new_env}}
+  rescue
+    error ->
+      detail = "#{inspect(error.__struct__)}: #{Exception.message(error)}"
+      {internal_error(bash, detail), put_in(bash.interpreter.halted, true)}
+  end
+
+  @internal_error_bytes 512
+  @internal_error_overhead byte_size("bash: internal error ()\n")
+
+  @doc """
+  Build the shell-shaped result for an exception that escaped containment.
+
+  Public so `JustBash.exec/2`'s outer net reports the same way the statement
+  loop does. `Exception.message/1` is unbounded from the sandbox's point of
+  view — `inspect/1` alone allows 4096 bytes per binary and 50 collection
+  elements — so a `MatchError` or `KeyError` carrying interpreter or filesystem
+  state could inline sandbox file contents into a stderr the host asked to be
+  capped. The detail is truncated to fit `:max_output_bytes`, or 512 bytes,
+  whichever is smaller.
+  """
+  @spec internal_error(JustBash.t(), String.t()) :: result()
+  def internal_error(bash, detail) do
+    budget = max(internal_error_cap(bash.limits) - @internal_error_overhead, 0)
+    stderr = "bash: internal error (#{truncate_utf8(detail, budget)})\n"
+    %{stdout: "", stderr: stderr, exit_code: 1, env: bash.env}
+  end
+
+  defp internal_error_cap(%Limit{max_output_bytes: max_output_bytes}),
+    do: min(@internal_error_bytes, max_output_bytes)
+
+  defp internal_error_cap(nil), do: @internal_error_bytes
+
+  defp truncate_utf8(binary, max_bytes) when byte_size(binary) <= max_bytes, do: binary
+
+  defp truncate_utf8(binary, max_bytes) do
+    prefix = binary_part(binary, 0, max_bytes)
+    if String.valid?(prefix), do: prefix, else: truncate_utf8(binary, max_bytes - 1)
+  end
+
   defp has_short_circuit_operators?(%AST.Statement{operators: operators}) do
     Enum.any?(operators, &(&1 in [:and, :or]))
   end
@@ -79,6 +130,10 @@ defmodule JustBash.Interpreter.Executor do
     if bash.interpreter.halted do
       {%{stdout: "", stderr: "", exit_code: 1}, bash}
     else
+      # The statement loop is the only place a script can spin indefinitely
+      # while every counting limit stays flat, so the wall clock is checked here.
+      Limit.check_deadline!(bash)
+
       tracked_before = bash.interpreter.output_bytes
       {result, new_bash} = do_execute_statement(bash, stmt)
 
@@ -194,16 +249,20 @@ defmodule JustBash.Interpreter.Executor do
   """
   @spec execute_pipeline(JustBash.t(), AST.Pipeline.t()) :: {result(), JustBash.t()}
   def execute_pipeline(bash, %AST.Pipeline{commands: commands, negated: negated}) do
-    # Track all exit codes for pipefail (prepend for O(1), reverse at end)
-    {final_result, final_bash, exit_codes_reversed} =
-      Enum.reduce(commands, {%{stdout: "", stderr: "", exit_code: 0}, bash, []}, fn cmd,
-                                                                                    {prev_result,
-                                                                                     current_bash,
-                                                                                     codes} ->
+    # Track all exit codes for pipefail (prepend for O(1), reverse at end).
+    # Only stdout is piped onwards; every stage's stderr goes to the shell's
+    # stderr, so it is accumulated as iodata rather than overwritten.
+    {final_result, final_bash, exit_codes_reversed, stderr_io} =
+      Enum.reduce(commands, {%{stdout: "", stderr: "", exit_code: 0}, bash, [], []}, fn cmd,
+                                                                                        {prev_result,
+                                                                                         current_bash,
+                                                                                         codes,
+                                                                                         errs} ->
         {result, new_bash} = execute_command(current_bash, cmd, prev_result.stdout)
-        {result, new_bash, [result.exit_code | codes]}
+        {result, new_bash, [result.exit_code | codes], [errs, result.stderr]}
       end)
 
+    final_result = %{final_result | stderr: IO.iodata_to_binary(stderr_io)}
     exit_codes = Enum.reverse(exit_codes_reversed)
 
     # Set PIPESTATUS array with exit codes from each command in the pipeline
@@ -256,8 +315,13 @@ defmodule JustBash.Interpreter.Executor do
   def execute_command(bash, %AST.SimpleCommand{name: nil, assignments: assignments}, _stdin) do
     # credo:disable-for-next-line Credo.Check.Readability.PreferImplicitTry
     try do
-      new_bash = execute_assignments(bash, assignments)
-      {%{stdout: "", stderr: "", exit_code: 0}, new_bash}
+      {new_bash, effects} = execute_assignments(bash, assignments)
+      {stderr, subst_exit_code, _assigns} = Expansion.take_substitutions(effects)
+
+      # With no command to claim `$?`, a bare assignment reports the exit status
+      # of the last command substitution it ran — `x=$(cat /nope)` is exit 1 in
+      # bash. Verified against GNU bash 3.2.57.
+      {%{stdout: "", stderr: stderr, exit_code: subst_exit_code || 0}, new_bash}
     rescue
       e in ArithmeticError ->
         {%{stdout: "", stderr: "bash: #{Exception.message(e)}\n", exit_code: 1}, bash}
@@ -369,7 +433,7 @@ defmodule JustBash.Interpreter.Executor do
   # --- Simple Command Execution (with implicit try for UnsetVariableError) ---
 
   defp do_execute_simple_command(bash, name, args, assignments, redirs, stdin) do
-    temp_bash = execute_assignments(bash, assignments)
+    {temp_bash, assign_effects} = execute_assignments(bash, assignments)
     {cmd_name, cmd_assigns} = Expansion.expand_word_parts(temp_bash, name.parts)
 
     # Apply any assignments from ${VAR:=default} expansions
@@ -378,23 +442,33 @@ defmodule JustBash.Interpreter.Executor do
     # Expand args sequentially, applying any assignments between each
     # This ensures side effects like $((x++)) are visible to subsequent args
     # Use prepend for O(1) and reverse at end for correct order
-    {expanded_args_reversed, temp_bash} =
-      Enum.reduce(args, {[], temp_bash}, fn arg, {acc, current_bash} ->
+    {expanded_args_reversed, temp_bash, arg_effects} =
+      Enum.reduce(args, {[], temp_bash, []}, fn arg, {acc, current_bash, effects} ->
         {expanded, arg_assigns} = Expansion.expand_word_with_glob(current_bash, arg.parts)
         current_bash = apply_pending_assignments(current_bash, arg_assigns)
         # Prepend expanded (which is a list) reversed, so final reverse gives correct order
-        {Enum.reverse(expanded) ++ acc, current_bash}
+        {Enum.reverse(expanded) ++ acc, current_bash, [effects, arg_assigns]}
       end)
 
     expanded_args = Enum.reverse(expanded_args_reversed)
+
+    # A diagnostic produced while expanding goes to the shell's stderr, not
+    # through the command's redirections — bash performs redirections after
+    # expansion, so `echo $(cat /nope) 2>/dev/null` still prints it.
+    {expansion_stderr, _code, _assigns} =
+      (assign_effects ++ cmd_assigns ++ List.flatten(arg_effects))
+      |> Expansion.take_substitutions()
 
     # Extract heredoc content as stdin if present
     {heredoc_stdin, non_heredoc_redirs} = Redirection.extract_heredoc_stdin(temp_bash, redirs)
     effective_stdin = heredoc_stdin || stdin
 
-    with_redirections(temp_bash, non_heredoc_redirs, fn temp_bash ->
-      invoke_command(temp_bash, cmd_name, expanded_args, effective_stdin)
-    end)
+    {result, new_bash} =
+      with_redirections(temp_bash, non_heredoc_redirs, fn temp_bash ->
+        invoke_command(temp_bash, cmd_name, expanded_args, effective_stdin)
+      end)
+
+    {%{result | stderr: expansion_stderr <> result.stderr}, new_bash}
   rescue
     e in Expansion.UnsetVariableError ->
       {%{stdout: "", stderr: "bash: #{Exception.message(e)}\n", exit_code: 1}, bash}
@@ -406,34 +480,78 @@ defmodule JustBash.Interpreter.Executor do
   defp invoke_command(bash, cmd_name, args, stdin) do
     case Map.get(bash.functions, cmd_name) do
       nil ->
-        JustBash.Telemetry.command_span(cmd_name, args, fn ->
-          {result, new_bash} =
-            case Map.get(bash.commands, cmd_name) do
-              nil -> execute_builtin(bash, cmd_name, args, stdin)
-              module -> execute_custom_command(bash, cmd_name, module, args, stdin)
-            end
-
-          # A JustBash.CLI router stashes the resolved subcommand path here; surface it
-          # in telemetry and strip it before the result reaches the shell.
-          {subcommand, result} = Map.pop(result, :__subcommand__)
-
-          stop_metadata = %{
-            exit_code: result.exit_code,
-            bytes_in: byte_size(stdin),
-            bytes_out: byte_size(result.stdout) + byte_size(result.stderr)
-          }
-
-          stop_metadata =
-            if subcommand,
-              do: Map.put(stop_metadata, :subcommand, subcommand),
-              else: stop_metadata
-
-          {{result, new_bash}, stop_metadata}
+        contain_command_crash(bash, cmd_name, fn ->
+          dispatch_with_span(bash, cmd_name, args, stdin)
         end)
 
       func_body ->
         execute_function(bash, func_body, args)
     end
+  end
+
+  defp dispatch_with_span(bash, cmd_name, args, stdin) do
+    JustBash.Telemetry.command_span(cmd_name, args, fn ->
+      {result, new_bash} =
+        case Map.get(bash.commands, cmd_name) do
+          nil -> execute_builtin(bash, cmd_name, args, stdin)
+          module -> execute_custom_command(bash, cmd_name, module, args, stdin)
+        end
+
+      # A JustBash.CLI router stashes the resolved subcommand path here; surface it
+      # in telemetry and strip it before the result reaches the shell.
+      {subcommand, result} = Map.pop(result, :__subcommand__)
+
+      stop_metadata = %{
+        exit_code: result.exit_code,
+        bytes_in: byte_size(stdin),
+        bytes_out: byte_size(result.stdout) + byte_size(result.stderr)
+      }
+
+      stop_metadata =
+        if subcommand,
+          do: Map.put(stop_metadata, :subcommand, subcommand),
+          else: stop_metadata
+
+      {{result, new_bash}, stop_metadata}
+    end)
+  end
+
+  # Containment, not defensive coding: a command that raises is a bug, but the
+  # ~90 registry commands and any host-supplied command run on behalf of a
+  # caller that has no way to act on an Elixir exception naming a JustBash
+  # internal, so it must still get a shell-shaped answer.
+  #
+  # This sits *outside* `command_span/3` on purpose. Containing the raise
+  # inside it means `:telemetry.span/3` never sees the exception, and the
+  # documented `[:just_bash, :command, :exception]` event silently stops
+  # firing — turning a loud failure class into an ordinary exit 1,
+  # indistinguishable in metrics from a script legitimately failing.
+  defp contain_command_crash(bash, cmd_name, dispatch) do
+    # credo:disable-for-next-line Credo.Check.Readability.PreferImplicitTry
+    try do
+      dispatch.()
+    rescue
+      # These have handlers further up that produce a better diagnostic than
+      # "crashed", and a limit breach must keep unwinding to halt the script.
+      e in [Limit.ExceededError, Expansion.UnsetVariableError, ArithmeticError] ->
+        reraise e, __STACKTRACE__
+
+      error ->
+        command_crashed(
+          bash,
+          cmd_name,
+          "#{inspect(error.__struct__)}: #{Exception.message(error)}"
+        )
+    catch
+      kind, reason ->
+        command_crashed(bash, cmd_name, "#{kind}: #{inspect(reason)}")
+    end
+  end
+
+  defp command_crashed(bash, cmd_name, detail) do
+    kind = if Map.has_key?(bash.commands, cmd_name), do: "custom command", else: "command"
+    stderr = "bash: #{cmd_name}: #{kind} crashed (#{detail})\n"
+    {%{stdout: "", stderr: stderr, exit_code: 1}, bash}
   end
 
   # --- Redirections ---
@@ -731,9 +849,16 @@ defmodule JustBash.Interpreter.Executor do
     end)
   end
 
+  # Returns the updated shell plus the expansion side effects the assignments
+  # produced, so the caller can surface a command substitution's diagnostic and
+  # exit status — see `Expansion.take_substitutions/1`.
   defp execute_assignments(bash, assignments) do
-    Enum.reduce(assignments, bash, fn %AST.Assignment{name: name, value: value, array: array},
-                                      acc ->
+    Enum.reduce(assignments, {bash, []}, fn %AST.Assignment{
+                                              name: name,
+                                              value: value,
+                                              array: array
+                                            },
+                                            {acc, effects} ->
       case array do
         nil ->
           # Scalar assignment
@@ -748,7 +873,7 @@ defmodule JustBash.Interpreter.Executor do
           # Expand variable references in associative array subscripts
           # e.g. arr[$key] should store as arr[expanded_key]
           resolved_name = expand_assignment_subscript(acc, name)
-          %{acc | env: Map.put(acc.env, resolved_name, expanded_value)}
+          {%{acc | env: Map.put(acc.env, resolved_name, expanded_value)}, effects ++ pending}
 
         elements when is_list(elements) ->
           # Array assignment: arr=(a b c) or arr=($(echo "a b c"))
@@ -781,7 +906,7 @@ defmodule JustBash.Interpreter.Executor do
           first_element = Map.get(env, "#{name}[0]", "")
           env = Map.put(env, name, first_element)
 
-          %{acc | env: env}
+          {%{acc | env: env}, effects}
       end
     end)
   end
@@ -826,12 +951,15 @@ defmodule JustBash.Interpreter.Executor do
     end
   end
 
-  # Apply pending variable assignments from expansions like ${VAR:=default} or $((x++))
+  # Apply pending variable assignments from expansions like ${VAR:=default} or
+  # $((x++)). Command-substitution traces travel in the same list — see
+  # `Expansion.take_substitutions/1` — but assign nothing.
   defp apply_pending_assignments(bash, []), do: bash
 
-  defp apply_pending_assignments(bash, assignments) do
-    Enum.reduce(assignments, bash, fn {name, value}, acc ->
-      %{acc | env: Map.put(acc.env, name, value)}
+  defp apply_pending_assignments(bash, effects) do
+    Enum.reduce(effects, bash, fn
+      {:substitution, _stderr, _code}, acc -> acc
+      {name, value}, acc -> %{acc | env: Map.put(acc.env, name, value)}
     end)
   end
 
@@ -848,30 +976,20 @@ defmodule JustBash.Interpreter.Executor do
 
   @control_signal_keys [:__break__, :__continue__, :__return__]
 
+  # A raise here is contained by `contain_command_crash/3`, outside the
+  # telemetry span, so a host-supplied command that crashes is reported the
+  # same way a registry one is — and stays visible in telemetry.
   defp execute_custom_command(bash, cmd_name, command, args, stdin) do
     bash = Limit.step!(bash)
 
-    # credo:disable-for-next-line Credo.Check.Readability.PreferImplicitTry
-    try do
-      case dispatch_custom_command(command, bash, args, stdin) do
-        {%{stdout: stdout, stderr: stderr, exit_code: exit_code} = result, %JustBash{} = new_bash}
-        when is_binary(stdout) and is_binary(stderr) and is_integer(exit_code) and exit_code >= 0 ->
-          # Strip any internal control-flow signals that could leak from custom commands
-          {Map.drop(result, @control_signal_keys), new_bash}
+    case dispatch_custom_command(command, bash, args, stdin) do
+      {%{stdout: stdout, stderr: stderr, exit_code: exit_code} = result, %JustBash{} = new_bash}
+      when is_binary(stdout) and is_binary(stderr) and is_integer(exit_code) and exit_code >= 0 ->
+        # Strip any internal control-flow signals that could leak from custom commands
+        {Map.drop(result, @control_signal_keys), new_bash}
 
-        _ ->
-          custom_command_error(bash, cmd_name, "custom command returned an invalid result")
-      end
-    rescue
-      error ->
-        message =
-          "custom command crashed (#{inspect(error.__struct__)}: #{Exception.message(error)})"
-
-        custom_command_error(bash, cmd_name, message)
-    catch
-      kind, reason ->
-        message = "custom command #{kind}: #{inspect(reason)}"
-        custom_command_error(bash, cmd_name, message)
+      _ ->
+        custom_command_error(bash, cmd_name, "custom command returned an invalid result")
     end
   end
 

@@ -388,14 +388,44 @@ defmodule JustBash do
   """
   @spec exec(t(), String.t()) :: {exec_result(), t()}
   def exec(bash, command) when is_binary(command) do
-    # Reset counters only for top-level exec (not nested eval/source)
-    bash =
-      if bash.interpreter.exec_depth == 0 do
-        %{bash | interpreter: State.reset_counters(bash.interpreter)}
-      else
-        bash
-      end
+    bash
+    |> arm_top_level()
+    |> do_exec(command)
+  rescue
+    # Containment, not defensive coding. `exec/2` is a trust boundary: it runs
+    # untrusted script text on behalf of a host that has no way to interpret an
+    # Elixir exception naming a JustBash internal. A raise reaching here is a
+    # bug in JustBash, but the host must still get a shell-shaped answer.
+    #
+    # This is the last resort only. Commands are contained at
+    # `Executor.contain_command_crash/3` and everything the statement loop runs
+    # — expansion, redirection, control flow — at `Executor.run_statement/2`,
+    # both of which keep the work that came before. Reaching *here* means the
+    # raise happened outside the statement loop (parsing, the EXIT trap), where
+    # there is no session state left to preserve.
+    error ->
+      internal_error(bash, "#{inspect(error.__struct__)}: #{Exception.message(error)}")
+  catch
+    kind, reason ->
+      internal_error(bash, "#{kind}: #{inspect(reason)}")
+  end
 
+  # Reset counters and arm the wall clock only for top-level execution; nested
+  # eval/source run inside the caller's budget rather than starting a fresh one.
+  defp arm_top_level(%__MODULE__{interpreter: %{exec_depth: 0}} = bash) do
+    interpreter =
+      bash.interpreter
+      |> State.reset_counters()
+      |> State.arm_deadline(Limit.deadline(bash.limits))
+
+    %{bash | interpreter: interpreter}
+  end
+
+  defp arm_top_level(%__MODULE__{} = bash), do: bash
+
+  defp internal_error(bash, detail), do: {Executor.internal_error(bash, detail), bash}
+
+  defp do_exec(bash, command) do
     JustBash.Telemetry.session_span(self(), fn ->
       case Parser.parse(command) do
         {:ok, ast} ->
@@ -490,7 +520,22 @@ defmodule JustBash do
   end
 
   @doc """
-  Execute a bash command, raising on parse errors.
+  Execute a bash command, raising instead of containing failures.
+
+  Same limits as `exec/2` — including `:max_wall_ms`, which is armed here too,
+  so a script that spins is bounded by both entry points.
+
+  It differs from `exec/2` in what it does with a failure it cannot express as
+  a shell result. It raises a `RuntimeError` on a parse error, where `exec/2`
+  returns exit 2 with a `bash: syntax error: ...` diagnostic; and it propagates
+  any exception that escapes the interpreter's own containment — the EXIT trap
+  and telemetry are the paths that can still do that — where `exec/2` reports
+  `bash: internal error (...)`.
+
+  A command that crashes and a raise from inside the statement loop are
+  contained by the interpreter itself, so both entry points get a shell result
+  for those. A host running untrusted script text should still prefer `exec/2`,
+  which is the documented trust boundary.
 
   ## Examples
 
@@ -499,6 +544,8 @@ defmodule JustBash do
   """
   @spec exec!(t(), String.t()) :: {exec_result(), t()}
   def exec!(bash, command) do
+    bash = arm_top_level(bash)
+
     JustBash.Telemetry.session_span(self(), fn ->
       case Parser.parse(command) do
         {:ok, ast} ->
