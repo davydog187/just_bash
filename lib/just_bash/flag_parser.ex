@@ -6,7 +6,14 @@ defmodule JustBash.FlagParser do
   - Boolean flags: `-a`, `-l`, `-v`
   - Combined flags: `-la` (equivalent to `-l -a`)
   - Value flags: `-n 10`, `-d ","` (flag that takes next argument)
+  - Getopt clusters ending in a value flag: `-nk2` is `-n -k 2`
   - Stop parsing at `--`
+  - `--help`, answered from the spec itself
+
+  A flag the spec does not describe is an error, never an operand. Demoting it
+  turned `sort -Q file` into a read of a file named `-Q`, which sort reports as
+  nothing at all: empty stdout, empty stderr, exit 0. Callers get
+  `{:error, {:unknown_flag, flag}}` and report it with `format_error/3`.
 
   ## Usage
 
@@ -14,17 +21,32 @@ defmodule JustBash.FlagParser do
       spec = %{
         boolean: [:a, :l, :v, :r],
         value: [:n, :d],
+        integer: [:n],
+        value_labels: %{n: "number of lines"},
         defaults: %{a: false, l: false, v: false, r: false, n: 10, d: nil}
       }
 
       # Parse arguments
-      {flags, rest} = FlagParser.parse(args, spec)
+      case FlagParser.parse(args, spec) do
+        {:ok, flags, rest} -> ...
+        :help -> FlagParser.help("ls", spec)
+        {:error, reason} -> FlagParser.format_error("ls", reason, @usage)
+      end
 
   ## Flag Specification
 
   - `:boolean` - List of single-character atoms for boolean flags
   - `:value` - List of single-character atoms for flags that take a value
   - `:defaults` - Map of default values for all flags
+  - `:aliases` - Map of flag string to atom, for spellings that are not the
+    atom itself (`"R" => :r`, `"-recursive" => :r`)
+  - `:multi_value` - Value flags that accumulate a list instead of overwriting
+  - `:integer` - Value flags whose value is a count. Only these are converted;
+    everything else stays a string, so `sort -t 1` is the delimiter `"1"`
+  - `:value_labels` - What an `:integer` flag counts, as GNU names it in
+    `invalid number of lines: 'abc'`. Required for every `:integer` flag
+  - `:usage` - The synopsis line `help/2` prints, defaulting to
+    `"<command> [OPTION]..."`
   """
 
   @type flag_spec :: %{
@@ -32,48 +54,151 @@ defmodule JustBash.FlagParser do
           :value => [atom()],
           :defaults => map(),
           optional(:aliases) => map(),
-          optional(:multi_value) => [atom()]
+          optional(:multi_value) => [atom()],
+          optional(:integer) => [atom()],
+          optional(:value_labels) => %{atom() => String.t()},
+          optional(:usage) => String.t()
         }
 
-  @type parse_result :: {map(), [String.t()]}
+  @type error ::
+          {:unknown_flag, String.t()}
+          | {:missing_value, String.t()}
+          | {:invalid_value, String.t(), String.t()}
+
+  @type parse_result :: {:ok, map(), [String.t()]} | :help | {:error, error()}
 
   @doc """
   Parse command-line arguments according to the given flag specification.
 
-  Returns a tuple of `{flags, remaining_args}` where:
+  Returns `{:ok, flags, remaining_args}` where:
   - `flags` is a map containing all flag values
   - `remaining_args` is a list of non-flag arguments
 
+  Returns `:help` for `--help`, and `{:error, reason}` for the first argument
+  that is flag-shaped but not in the spec, for a value flag with nothing after
+  it, and for a value declared `:integer` that is not a number.
+
   ## Examples
 
-      iex> spec = %{boolean: [:a, :l], value: [:n], defaults: %{a: false, l: false, n: 10}}
+      iex> spec = %{boolean: [:a, :l], value: [:n], integer: [:n], value_labels: %{n: "number of lines"}, defaults: %{a: false, l: false, n: 10}}
       iex> FlagParser.parse(["-a", "-n", "5", "file.txt"], spec)
-      {%{a: true, l: false, n: 5}, ["file.txt"]}
+      {:ok, %{a: true, l: false, n: 5}, ["file.txt"]}
 
       iex> spec = %{boolean: [:a, :l], value: [], defaults: %{a: false, l: false}}
       iex> FlagParser.parse(["-al", "dir"], spec)
-      {%{a: true, l: true}, ["dir"]}
+      {:ok, %{a: true, l: true}, ["dir"]}
+
+      iex> spec = %{boolean: [:a, :l], value: [], defaults: %{a: false, l: false}}
+      iex> FlagParser.parse(["-Q", "dir"], spec)
+      {:error, {:unknown_flag, "Q"}}
   """
   @spec parse([String.t()], flag_spec()) :: parse_result()
   def parse(args, spec) do
     do_parse(args, spec, spec.defaults, [])
   end
 
+  @doc """
+  Render a `parse/2` error the way GNU coreutils words it, followed by `usage`.
+
+  A short option is named by its character and a long option in full, because
+  that is the unit that was rejected — `-laQ` is a bad `Q`, and
+  `invalid option -- '-'` for `--nope` identifies nothing.
+
+  ## Examples
+
+      iex> FlagParser.format_error("sort", {:unknown_flag, "Q"}, "")
+      "sort: invalid option -- 'Q'\\n"
+
+      iex> FlagParser.format_error("sort", {:unknown_flag, "--nope"}, "")
+      "sort: unrecognized option '--nope'\\n"
+
+      iex> FlagParser.format_error("head", {:invalid_value, "number of lines", "abc"}, "")
+      "head: invalid number of lines: 'abc'\\n"
+  """
+  @spec format_error(String.t(), error(), String.t()) :: String.t()
+  def format_error(command, {:unknown_flag, "--" <> _ = flag}, usage),
+    do: "#{command}: unrecognized option '#{flag}'\n" <> usage
+
+  def format_error(command, {:unknown_flag, flag}, usage),
+    do: "#{command}: invalid option -- '#{flag}'\n" <> usage
+
+  def format_error(command, {:missing_value, "--" <> _ = flag}, usage),
+    do: "#{command}: option '#{flag}' requires an argument\n" <> usage
+
+  def format_error(command, {:missing_value, flag}, usage),
+    do: "#{command}: option requires an argument -- '#{flag}'\n" <> usage
+
+  # GNU prints no `Try --help` line for a bad count, so neither do we.
+  def format_error(command, {:invalid_value, label, value}, _usage),
+    do: "#{command}: invalid #{label}: '#{value}'\n"
+
+  @doc """
+  The usage `Try '<command> --help' for more information.` promises.
+
+  Rendered from the spec, so it lists exactly the flags the parser accepts and
+  cannot drift from them.
+
+  ## Examples
+
+      iex> spec = %{boolean: [:a], value: [:n], defaults: %{a: false, n: nil}}
+      iex> FlagParser.help("demo", spec)
+      "Usage: demo [OPTION]...\\nOptions this shell implements:\\n  -a\\n  -n VALUE\\n"
+  """
+  @spec help(String.t(), flag_spec()) :: String.t()
+  def help(command, spec) do
+    synopsis = Map.get(spec, :usage, "#{command} [OPTION]...")
+
+    ["Usage: ", synopsis, "\nOptions this shell implements:\n", option_lines(spec)]
+    |> IO.iodata_to_binary()
+  end
+
+  defp option_lines(spec) do
+    values = value_flags(spec)
+
+    spec
+    |> flag_lookup()
+    |> Enum.group_by(fn {_spelling, atom} -> atom end, fn {spelling, _atom} -> "-" <> spelling end)
+    |> Enum.map(fn {atom, spellings} ->
+      {atom, spellings |> typeable(atom) |> Enum.sort_by(&spelling_order(&1, atom))}
+    end)
+    |> Enum.sort_by(fn {_atom, [first | _]} -> {String.downcase(first), first} end)
+    |> Enum.map(fn {atom, spellings} ->
+      argument = if atom in values, do: " VALUE", else: ""
+      ["  ", Enum.join(spellings, ", "), argument, "\n"]
+    end)
+  end
+
+  # `flag_lookup/1` also answers to a multi-character atom's own name, so grep
+  # accepts `-with_filename` as well as `-H`. Printing that would advertise a
+  # spelling nobody means to type, so only real short and long options are
+  # listed — unless the atom's name is all a flag has.
+  defp typeable(spellings, atom) do
+    case Enum.filter(spellings, &short_or_long?/1) do
+      [] -> ["-" <> Atom.to_string(atom)]
+      typeable -> typeable
+    end
+  end
+
+  defp short_or_long?("-" <> name), do: String.length(name) == 1 or String.starts_with?(name, "-")
+
+  # The flag's own name first, then its other short spellings, then the long
+  # ones — the order a reader scans for "which letter do I type".
+  defp spelling_order(spelling, atom) do
+    {String.starts_with?(spelling, "--"), spelling != "-" <> Atom.to_string(atom), spelling}
+  end
+
   defp do_parse([], _spec, flags, rest) do
-    {flags, Enum.reverse(rest)}
+    {:ok, flags, Enum.reverse(rest)}
   end
 
   defp do_parse(["--" | remaining], _spec, flags, rest) do
-    {flags, Enum.reverse(rest) ++ remaining}
+    {:ok, flags, Enum.reverse(rest) ++ remaining}
   end
 
   defp do_parse(["-" <> flag_str | remaining], spec, flags, rest) when flag_str != "" do
     case parse_flag(flag_str, remaining, spec, flags) do
-      {:ok, new_flags, new_remaining} ->
-        do_parse(new_remaining, spec, new_flags, rest)
-
-      :not_a_flag ->
-        do_parse(remaining, spec, flags, ["-" <> flag_str | rest])
+      {:ok, new_flags, new_remaining} -> do_parse(new_remaining, spec, new_flags, rest)
+      other -> other
     end
   end
 
@@ -82,110 +207,133 @@ defmodule JustBash.FlagParser do
   end
 
   defp parse_flag(flag_str, remaining, spec, flags) do
-    aliases = Map.get(spec, :aliases, %{})
     lookup = flag_lookup(spec)
-    flag_atom = Map.get(aliases, flag_str) || Map.get(lookup, flag_str)
+    flag_atom = Map.get(lookup, flag_str)
 
     cond do
       flag_atom in spec.boolean ->
         {:ok, Map.put(flags, flag_atom, true), remaining}
 
-      flag_atom in spec.value ->
-        case remaining do
-          [value | rest] ->
-            parsed_value = parse_value(value)
-            {:ok, put_flag(flags, flag_atom, parsed_value, spec), rest}
+      flag_atom in value_flags(spec) ->
+        take_value(flag_atom, flag_str, remaining, spec, flags)
 
-          [] ->
-            :not_a_flag
-        end
-
-      flag_atom in Map.get(spec, :multi_value, []) ->
-        case remaining do
-          [value | rest] ->
-            parsed_value = parse_value(value)
-            {:ok, put_flag(flags, flag_atom, parsed_value, spec), rest}
-
-          [] ->
-            :not_a_flag
-        end
-
-      String.length(flag_str) > 1 ->
-        combined_lookup = Map.merge(lookup, aliases)
-
-        case try_attached_value_flag(flag_str, spec, flags, combined_lookup) do
-          {:ok, new_flags} ->
-            {:ok, new_flags, remaining}
-
-          :error ->
-            case parse_combined_flags(flag_str, spec, flags, combined_lookup) do
-              {:ok, new_flags} -> {:ok, new_flags, remaining}
-              :error -> try_numeric_flag(flag_str, remaining, spec, flags)
-            end
-        end
+      flag_str == "-help" ->
+        :help
 
       true ->
-        try_numeric_flag(flag_str, remaining, spec, flags)
+        parse_unnamed(flag_str, remaining, spec, flags, lookup)
     end
   end
 
-  defp try_attached_value_flag(flag_str, spec, flags, lookup) do
-    <<first_char::binary-size(1), rest::binary>> = flag_str
-    flag_atom = Map.get(lookup, first_char)
-    multi_value = Map.get(spec, :multi_value, [])
+  # A flag the spec does not name outright is a bare count (`head -5`), a
+  # getopt cluster (`sort -nk2`), or an error.
+  defp parse_unnamed("-" <> _ = long_flag_str, _remaining, _spec, _flags, _lookup) do
+    {:error, {:unknown_flag, display_flag(long_flag_str)}}
+  end
 
-    if flag_atom != nil and (flag_atom in spec.value or flag_atom in multi_value) and rest != "" do
-      parsed_value = parse_value(rest)
-      {:ok, put_flag(flags, flag_atom, parsed_value, spec)}
-    else
-      :error
+  defp parse_unnamed(flag_str, remaining, spec, flags, lookup) do
+    case numeric_shorthand(flag_str, spec) do
+      {:ok, count} ->
+        {:ok, Map.put(flags, :n, count), remaining}
+
+      :error ->
+        parse_cluster(String.graphemes(flag_str), remaining, spec, flags, lookup)
     end
   end
 
-  defp parse_combined_flags(flag_str, spec, flags, lookup) do
-    atoms = Enum.map(String.graphemes(flag_str), &Map.get(lookup, &1))
-
-    if Enum.all?(atoms, &(&1 in spec.boolean)) do
-      {:ok, Enum.reduce(atoms, flags, fn atom, acc -> Map.put(acc, atom, true) end)}
+  defp numeric_shorthand(flag_str, spec) do
+    with true <- :n in spec.value,
+         {count, ""} <- Integer.parse(flag_str) do
+      {:ok, count}
     else
-      :error
+      _ -> :error
     end
+  end
+
+  # getopt walks a cluster one character at a time: booleans accumulate, and a
+  # value flag takes the rest of the cluster as its argument — or the next
+  # argument when it is the last character. It stops on the first character the
+  # spec does not describe at all, so the diagnostic can never name a flag the
+  # command implements.
+  defp parse_cluster([], remaining, _spec, flags, _lookup), do: {:ok, flags, remaining}
+
+  defp parse_cluster([char | rest], remaining, spec, flags, lookup) do
+    flag_atom = Map.get(lookup, char)
+
+    cond do
+      flag_atom in spec.boolean ->
+        parse_cluster(rest, remaining, spec, Map.put(flags, flag_atom, true), lookup)
+
+      flag_atom in value_flags(spec) ->
+        take_cluster_value(flag_atom, char, Enum.join(rest), remaining, spec, flags)
+
+      true ->
+        {:error, {:unknown_flag, char}}
+    end
+  end
+
+  defp take_cluster_value(flag_atom, char, "", remaining, spec, flags) do
+    take_value(flag_atom, char, remaining, spec, flags)
+  end
+
+  defp take_cluster_value(flag_atom, _char, attached, remaining, spec, flags) do
+    with {:ok, value} <- parse_value(attached, flag_atom, spec) do
+      {:ok, put_flag(flags, flag_atom, value, spec), remaining}
+    end
+  end
+
+  defp take_value(flag_atom, _flag_str, [raw | rest], spec, flags) do
+    with {:ok, value} <- parse_value(raw, flag_atom, spec) do
+      {:ok, put_flag(flags, flag_atom, value, spec), rest}
+    end
+  end
+
+  defp take_value(_flag_atom, flag_str, [], _spec, _flags) do
+    {:error, {:missing_value, display_flag(flag_str)}}
   end
 
   defp flag_lookup(spec) do
-    (spec.boolean ++ spec.value ++ Map.get(spec, :multi_value, []))
+    (spec.boolean ++ value_flags(spec))
     |> Map.new(fn atom -> {Atom.to_string(atom), atom} end)
+    |> Map.merge(Map.get(spec, :aliases, %{}))
   end
 
-  defp try_numeric_flag(flag_str, remaining, spec, flags) do
-    if :n in spec.value do
-      case Integer.parse(flag_str) do
-        {num, ""} ->
-          {:ok, Map.put(flags, :n, num), remaining}
+  defp value_flags(spec), do: spec.value ++ Map.get(spec, :multi_value, [])
 
-        _ ->
-          :not_a_flag
-      end
-    else
-      :not_a_flag
-    end
-  end
+  # `parse/2` sees one leading `-` already stripped, so a long option arrives
+  # here still carrying the second one.
+  defp display_flag("-" <> _ = long_flag_str), do: "-" <> long_flag_str
+  defp display_flag(short_flag_str), do: short_flag_str
 
   defp put_flag(flags, flag_atom, value, spec) do
-    multi_value = Map.get(spec, :multi_value, [])
-
-    if flag_atom in multi_value do
-      existing = Map.get(flags, flag_atom, [])
-      Map.put(flags, flag_atom, existing ++ [value])
+    if flag_atom in Map.get(spec, :multi_value, []) do
+      Map.put(flags, flag_atom, Map.get(flags, flag_atom, []) ++ [value])
     else
       Map.put(flags, flag_atom, value)
     end
   end
 
-  defp parse_value(value) do
-    case Integer.parse(value) do
-      {num, ""} -> num
-      _ -> value
+  # Only a flag declared `:integer` is a count. Coercing every value that looks
+  # like one made `sort -t 1` a delimiter of `1` rather than `"1"`; handing back
+  # a count that is not a number made `head -n abc` raise out of `Enum.take/2`.
+  defp parse_value(value, flag_atom, spec) do
+    if flag_atom in Map.get(spec, :integer, []) do
+      parse_count(value, flag_atom, spec)
+    else
+      {:ok, value}
     end
+  end
+
+  defp parse_count(value, flag_atom, spec) do
+    case Integer.parse(value) do
+      {count, ""} -> {:ok, count}
+      _ -> {:error, {:invalid_value, value_label(flag_atom, spec), value}}
+    end
+  end
+
+  # A spec that declares `:integer` without saying what is being counted cannot
+  # word the error, and that is a bug in the spec, not in the input.
+  defp value_label(flag_atom, spec) do
+    spec |> Map.fetch!(:value_labels) |> Map.fetch!(flag_atom)
   end
 end

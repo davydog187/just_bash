@@ -10,16 +10,37 @@ defmodule JustBash.Commands.Sort do
     boolean: [:r, :u, :n, :f],
     value: [:t],
     multi_value: [:k],
-    defaults: %{r: false, u: false, n: false, f: false, k: [], t: nil}
+    defaults: %{r: false, u: false, n: false, f: false, k: [], t: nil},
+    usage: "sort [OPTION]... [FILE]..."
   }
+
+  @usage "Try 'sort --help' for more information.\n"
 
   @impl true
   def names, do: ["sort"]
 
   @impl true
   def execute(bash, args, stdin) do
-    {flags, files} = FlagParser.parse(args, @flag_spec)
-    {content, fs} = get_content(bash, files, stdin)
+    case FlagParser.parse(args, @flag_spec) do
+      {:ok, flags, files} ->
+        sort(bash, flags, files, stdin)
+
+      :help ->
+        {Command.ok(FlagParser.help("sort", @flag_spec)), bash}
+
+      {:error, reason} ->
+        {Command.error(FlagParser.format_error("sort", reason, @usage), 2), bash}
+    end
+  end
+
+  defp sort(bash, flags, files, stdin) do
+    case get_content(bash, files, stdin) do
+      {:ok, content, fs} -> sorted(bash, flags, content, fs)
+      {:error, message} -> {Command.error(message, 2), bash}
+    end
+  end
+
+  defp sorted(bash, flags, content, fs) do
     # Don't trim - preserve empty lines. Only remove trailing empty if content ends with \n
     lines = String.split(content, "\n", trim: false)
 
@@ -39,16 +60,29 @@ defmodule JustBash.Commands.Sort do
     {Command.ok(output), %{bash | fs: fs}}
   end
 
-  defp get_content(bash, [], stdin), do: {stdin, bash.fs}
+  defp get_content(bash, [], stdin), do: {:ok, stdin, bash.fs}
+  defp get_content(bash, ["-" | _], stdin), do: {:ok, stdin, bash.fs}
 
+  # A file sort cannot read is reported, not read as empty: swallowing the
+  # error is how `sort -- -Q` answered with nothing at exit 0.
   defp get_content(bash, [file | _], _stdin) do
     resolved = FS.resolve_path(bash.cwd, file)
 
     case FS.read_file(bash.fs, resolved) do
-      {:ok, c, fs} -> {c, fs}
-      {:error, _} -> {"", bash.fs}
+      {:ok, content, fs} -> {:ok, content, fs}
+      {:error, error} -> {:error, read_error(file, error)}
     end
   end
+
+  # GNU sort has two templates, and which one it uses says where the failure
+  # happened. A directory opens, so it is the read that fails and coreutils
+  # says `read failed:`; everything else fails at open and says `cannot read:`.
+  # The reason always comes from strerror - naming a directory that exists
+  # "No such file or directory" is a false statement about the filesystem.
+  defp read_error(file, %VFS.Error{kind: :eisdir} = error),
+    do: "sort: read failed: #{file}: #{FS.strerror(error)}\n"
+
+  defp read_error(file, error), do: "sort: cannot read: #{file}: #{FS.strerror(error)}\n"
 
   defp sort_lines(lines, %{k: key_specs} = flags) when key_specs != [] do
     delimiter = flags[:t] || " "
@@ -96,8 +130,6 @@ defmodule JustBash.Commands.Sort do
         key_a < key_b
     end
   end
-
-  defp parse_key_spec(spec) when is_integer(spec), do: {spec, nil}
 
   defp parse_key_spec(spec) when is_binary(spec) do
     # Parse key spec like "2" or "2,2" or "2,2nr" or "1,1rn"

@@ -50,16 +50,33 @@ defmodule JustBash.Commands.Grep do
       r: false,
       with_filename: false,
       no_filename: false
-    }
+    },
+    usage: "grep [OPTION]... PATTERNS [FILE]..."
   }
+
+  @usage """
+  Usage: grep [OPTION]... PATTERNS [FILE]...
+  Try 'grep --help' for more information.
+  """
 
   @impl true
   def names, do: ["grep"]
 
   @impl true
   def execute(bash, args, stdin) do
-    {flags, rest} = FlagParser.parse(args, @flag_spec)
+    case FlagParser.parse(args, @flag_spec) do
+      {:ok, flags, rest} ->
+        grep(bash, flags, rest, stdin)
 
+      :help ->
+        {Command.ok(FlagParser.help("grep", @flag_spec)), bash}
+
+      {:error, reason} ->
+        {Command.error(FlagParser.format_error("grep", reason, @usage), 2), bash}
+    end
+  end
+
+  defp grep(bash, flags, rest, stdin) do
     case rest do
       [pattern | files] when files != [] ->
         execute_with_files(bash, pattern, files, flags)
