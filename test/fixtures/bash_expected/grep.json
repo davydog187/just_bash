@@ -209,6 +209,48 @@
       "name": "grep combined flags: grep -cv count inverted",
       "stderr": "",
       "stdout": "2\n"
+    },
+    {
+      "content_hash": "fe70c984fb3a65c3",
+      "exit_code": 0,
+      "name": "grep BRE alternation: backslash-pipe is alternation, not a literal pipe",
+      "stderr": "",
+      "stdout": "bodyweight noted\n"
+    },
+    {
+      "content_hash": "4b84a60be05b10fc",
+      "exit_code": 0,
+      "name": "grep BRE alternation: matches on any of several alternatives",
+      "stderr": "",
+      "stdout": "foo\nbaz\n"
+    },
+    {
+      "content_hash": "b58af548f549a2dc",
+      "exit_code": 0,
+      "name": "grep BRE alternation: no match among alternatives returns exit 1",
+      "stderr": "",
+      "stdout": "1\n"
+    },
+    {
+      "content_hash": "37d67361d0969a77",
+      "exit_code": 0,
+      "name": "grep BRE alternation: -E treats a backslash-pipe as an escaped literal pipe, not alternation",
+      "stderr": "",
+      "stdout": "a|b\n0\n"
+    },
+    {
+      "content_hash": "4e6647cdc9342927",
+      "exit_code": 0,
+      "name": "grep missing file: nonexistent path is an error, not a silent no-match",
+      "stderr": "grep: does-not-exist.txt: No such file or directory\n",
+      "stdout": "exists.txt\n2\n"
+    },
+    {
+      "content_hash": "e2bb48f461d8be28",
+      "exit_code": 0,
+      "name": "grep missing file: stderr names the missing path",
+      "stderr": "",
+      "stdout": "grep: does-not-exist.txt: No such file or directory\n"
     }
   ],
   "suite": "grep"

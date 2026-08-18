@@ -239,24 +239,44 @@ defmodule JustBash.Commands.Grep do
     Limit.check_regex_size!(bash.limits, pattern)
     opts = if flags.i, do: [:caseless], else: []
 
+    base_pattern =
+      if flags.f_fixed do
+        Regex.escape(pattern)
+      else
+        bre_alternation_to_pcre(pattern, flags)
+      end
+
     regex_pattern =
       cond do
-        flags.f_fixed ->
-          Regex.escape(pattern)
-
-        flags.w ->
-          "\\b" <> pattern <> "\\b"
-
-        flags.x ->
-          "^" <> pattern <> "$"
-
-        true ->
-          pattern
+        flags.w -> "\\b" <> base_pattern <> "\\b"
+        flags.x -> "^" <> base_pattern <> "$"
+        true -> base_pattern
       end
 
     case Regex.compile(regex_pattern, opts) do
       {:ok, regex} -> regex
       {:error, _} -> Regex.compile!(Regex.escape(pattern), opts)
+    end
+  end
+
+  # Real `grep` without `-E`/`-P` is BRE, where `\|` is alternation. This is
+  # PCRE (`Regex.compile/2`), where `\|` is an escaped literal pipe — and
+  # `\|` compiles cleanly either way, so passing a BRE pattern through
+  # unchanged never hits the `{:error, _}` fallback above. It just silently
+  # matches a literal pipe character that the input almost never contains,
+  # turning the single most common agent idiom (`grep -r "a\|b"`) into a
+  # quiet false negative instead of a compile error.
+  #
+  # This rewrites only `\|` -> `|`. Full BRE emulation — bare `(`, `)`, `{`
+  # as literals, `\(...\)` as groups, `\{n,m\}` as bounds — is a much larger
+  # surface with more ways to get it partially right, and is left alone
+  # rather than half-translated. `\|` is the dominant idiom and the one that
+  # caused the incident this fixes, so it is handled on its own.
+  defp bre_alternation_to_pcre(pattern, flags) do
+    if flags.e_ext or flags.p_pcre do
+      pattern
+    else
+      String.replace(pattern, "\\|", "|")
     end
   end
 
