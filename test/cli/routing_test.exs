@@ -157,6 +157,36 @@ defmodule JustBash.CLI.RoutingTest do
     end
   end
 
+  describe "flag-level did-you-mean" do
+    test "an unknown long flag declared by a sibling leaf names it" do
+      result = run("acme pr open 1 --report 5")
+      assert result.exit_code == 2
+      assert result.stderr =~ "unknown option: --report — did you mean 'acme pr review'?"
+    end
+
+    test "an unknown short flag declared by a sibling leaf names it" do
+      result = run("acme pr open 1 -v")
+      assert result.exit_code == 2
+      assert result.stderr =~ "unknown option: -v — did you mean 'acme pr review'?"
+    end
+
+    test "an unknown flag no sibling declares gets no suggestion" do
+      result = run("acme pr open 1 --bogus x")
+      assert result.exit_code == 2
+      assert result.stderr =~ "unknown option: --bogus\n"
+      refute result.stderr =~ "did you mean"
+    end
+
+    test "a flag declared by a leaf in a different group is not suggested" do
+      # `--report` belongs to `pr review`; `product list` is a sibling of `product`, not of
+      # `pr review`, so the group-scoped lookup must not reach across groups.
+      result = run("acme product list --report 5")
+      assert result.exit_code == 2
+      assert result.stderr =~ "unknown option: --report\n"
+      refute result.stderr =~ "did you mean"
+    end
+  end
+
   describe "passthrough flags" do
     defp passthrough_cli do
       CLI.new("acme",
