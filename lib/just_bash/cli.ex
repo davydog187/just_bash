@@ -720,7 +720,11 @@ defmodule JustBash.CLI do
   # the same group declares that exact flag — e.g. `dol log metric --weight` when `dol log
   # weight` is the leaf that takes `--weight`. This is not fuzzy matching like
   # `Help.unknown_subcommand/4`'s Jaro suggestion: the flag either is or isn't declared
-  # elsewhere in the group, so an exact declaration match is the whole signal.
+  # elsewhere in the group, so an exact declaration match is the whole signal — as long as
+  # that match is unique. `--verbose`, `--json` and `--force` are routinely declared by
+  # several leaves in one group, and there the first sibling in declaration order carries
+  # no more information than any other; a confidently-worded pointer at an arbitrary one
+  # is worse than none, so an ambiguous match yields no hint.
   #
   # Lives here (rather than in `ArgParser`) because only the CLI tree has a notion of
   # "sibling commands in the same group" — `ArgParser.parse/3` only ever sees one leaf's
@@ -732,10 +736,10 @@ defmodule JustBash.CLI do
     cli.commands
     |> resolve_group_commands(group_path)
     |> Enum.reject(&(&1.name == current_name or Command.group?(&1)))
-    |> Enum.find(&flag_declared?(&1.flags, flag))
+    |> Enum.filter(&flag_declared?(&1.flags, flag))
     |> case do
-      nil -> nil
-      %Command{name: name} -> "did you mean '#{command_label(cli, group_path ++ [name])}'?"
+      [%Command{name: name}] -> "did you mean '#{command_label(cli, group_path ++ [name])}'?"
+      _ambiguous_or_none -> nil
     end
   end
 
