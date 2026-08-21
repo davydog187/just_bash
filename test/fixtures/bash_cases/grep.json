@@ -180,6 +180,61 @@
       "name": "grep missing file: stderr names the missing path",
       "script": "grep 'a' does-not-exist.txt 2>err.txt; cat err.txt",
       "content_hash": "e2bb48f461d8be28"
+    },
+    {
+      "name": "grep -w with BRE alternation: the word anchors bind to the whole alternation, not one branch",
+      "script": "echo foobar | grep -w 'foo\\|bar'; echo $?",
+      "content_hash": "3583b257c06671d8"
+    },
+    {
+      "name": "grep -w with BRE alternation: a whole-word alternative still matches",
+      "script": "echo foo | grep -w 'nope\\|foo'; echo $?",
+      "content_hash": "09bb336226ca9975"
+    },
+    {
+      "name": "grep -x with BRE alternation: the line anchors bind to the whole alternation, not one branch",
+      "script": "echo foobaz | grep -x 'foo\\|bar'; echo $?",
+      "content_hash": "670ac038ba046609"
+    },
+    {
+      "name": "grep -x with BRE alternation: a whole-line alternative still matches",
+      "script": "echo bar | grep -x 'foo\\|bar'; echo $?",
+      "content_hash": "6579c93f70a9727a"
+    },
+    {
+      "name": "grep BRE: an escaped backslash before a pipe leaves the pipe a literal, not alternation",
+      "script": "echo 'a|b' | grep 'a\\\\|b'; echo $?",
+      "content_hash": "a9a7a5fe75c26949"
+    },
+    {
+      "name": "grep BRE: an escaped backslash before a pipe matches a literal backslash-pipe",
+      "script": "printf 'a\\\\|b\\n' | grep 'a\\\\|b'; echo $?",
+      "content_hash": "b3d93e5fc8476004"
+    },
+    {
+      "name": "grep BRE: a bare pipe is a literal, not alternation",
+      "script": "echo ab | grep 'a|b'; echo $?",
+      "content_hash": "7c97e022fdfef971"
+    },
+    {
+      "name": "grep BRE: a bare pipe matches a literal pipe character",
+      "script": "echo 'a|b' | grep 'a|b'; echo $?",
+      "content_hash": "abd3790733635d79"
+    },
+    {
+      "name": "grep error kind: a path under a regular file is Not a directory, not No such file",
+      "script": "echo hi > a.txt; grep hi a.txt/x; echo $?",
+      "content_hash": "182ef5287977a525"
+    },
+    {
+      "name": "grep -q: stops at the first match and never opens the later operands",
+      "script": "echo hi > a.txt; grep -q hi a.txt nope.txt; echo $?",
+      "content_hash": "9e5e9393471b7a48"
+    },
+    {
+      "name": "grep -q: an operand read before the match still reports its error",
+      "script": "echo hi > a.txt; grep -q hi nope.txt a.txt; echo $?",
+      "content_hash": "cfce295cc614eed8"
     }
   ]
 }

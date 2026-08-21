@@ -99,9 +99,16 @@ defmodule JustBash.Commands.Grep do
     show_filename =
       flags.with_filename or (length(expanded_files) > 1 and not flags.no_filename)
 
+    # `-q` is specified to exit "immediately ... if any match is found", so real
+    # grep never opens the operands after the first matching one and never
+    # reports their errors. Halting is that short-circuit — and it keeps the
+    # error of an operand read *before* the match, which GNU also prints.
     {results, any_match, errors, fs} =
-      Enum.reduce(expanded_files, {[], false, "", bash.fs}, fn file, acc ->
-        process_file(bash, file, stdin, regex, flags, show_filename, acc)
+      Enum.reduce_while(expanded_files, {[], false, "", bash.fs}, fn file, acc ->
+        case process_file(bash, file, stdin, regex, flags, show_filename, acc) do
+          {_, true, _, _} = matched when flags.q -> {:halt, matched}
+          next -> {:cont, next}
+        end
       end)
 
     build_files_result(%{bash | fs: fs}, results, any_match, errors, flags)
@@ -243,13 +250,16 @@ defmodule JustBash.Commands.Grep do
       if flags.f_fixed do
         Regex.escape(pattern)
       else
-        bre_alternation_to_pcre(pattern, flags)
+        bre_pipes_to_pcre(pattern, flags)
       end
 
+    # The group is not cosmetic: `\bfoo|bar\b` is read as `(\bfoo)|(bar\b)`,
+    # so each anchor would bind to a single branch and `-w`/`-x` would admit
+    # unanchored matches of every other one.
     regex_pattern =
       cond do
-        flags.w -> "\\b" <> base_pattern <> "\\b"
-        flags.x -> "^" <> base_pattern <> "$"
+        flags.w -> "\\b(?:" <> base_pattern <> ")\\b"
+        flags.x -> "^(?:" <> base_pattern <> ")$"
         true -> base_pattern
       end
 
@@ -259,26 +269,47 @@ defmodule JustBash.Commands.Grep do
     end
   end
 
-  # Real `grep` without `-E`/`-P` is BRE, where `\|` is alternation. This is
-  # PCRE (`Regex.compile/2`), where `\|` is an escaped literal pipe — and
-  # `\|` compiles cleanly either way, so passing a BRE pattern through
-  # unchanged never hits the `{:error, _}` fallback above. It just silently
-  # matches a literal pipe character that the input almost never contains,
-  # turning the single most common agent idiom (`grep -r "a\|b"`) into a
-  # quiet false negative instead of a compile error.
+  # Real `grep` without `-E`/`-P` is BRE, where `\|` is alternation and a bare
+  # `|` is an ordinary character. This is PCRE (`Regex.compile/2`), where those
+  # two meanings are exactly swapped — and both spellings compile cleanly either
+  # way, so a BRE pattern passed through unchanged never reaches the
+  # `{:error, _}` fallback above. It just quietly matches something else: `a\|b`
+  # looks for a literal pipe the input almost never contains, turning the single
+  # most common agent idiom (`grep -r "a\|b"`) into a false negative, while
+  # `a|b` matches either half of a pattern whose author meant it verbatim.
   #
-  # This rewrites only `\|` -> `|`. Full BRE emulation — bare `(`, `)`, `{`
-  # as literals, `\(...\)` as groups, `\{n,m\}` as bounds — is a much larger
-  # surface with more ways to get it partially right, and is left alone
-  # rather than half-translated. `\|` is the dominant idiom and the one that
-  # caused the incident this fixes, so it is handled on its own.
-  defp bre_alternation_to_pcre(pattern, flags) do
+  # One left-to-right scan fixes both, and scanning is what makes the escaped
+  # forms come out right. `a\\|b` is a literal backslash followed by a BRE pipe;
+  # a blind `String.replace(pattern, "\\|", "|")` finds a `\|` straddling the
+  # backslash pair and rewrites it, so the pattern ends up matching the literal
+  # text `a|b`. Consuming each backslash together with the character it escapes
+  # means an escaped character is never re-read as syntax.
+  #
+  # Only the pipe is translated. Full BRE emulation — bare `(`, `)`, `{` as
+  # literals, `\(...\)` as groups, `\{n,m\}` as bounds — is a much larger
+  # surface with more ways to land partially right, and is left alone rather
+  # than half-translated.
+  defp bre_pipes_to_pcre(pattern, flags) do
     if flags.e_ext or flags.p_pcre do
       pattern
     else
-      String.replace(pattern, "\\|", "|")
+      pattern |> do_bre_pipes_to_pcre([]) |> IO.iodata_to_binary()
     end
   end
+
+  defp do_bre_pipes_to_pcre(<<>>, acc), do: Enum.reverse(acc)
+
+  defp do_bre_pipes_to_pcre(<<"\\|", rest::binary>>, acc),
+    do: do_bre_pipes_to_pcre(rest, ["|" | acc])
+
+  defp do_bre_pipes_to_pcre(<<"\\", escaped::binary-size(1), rest::binary>>, acc),
+    do: do_bre_pipes_to_pcre(rest, ["\\" <> escaped | acc])
+
+  defp do_bre_pipes_to_pcre(<<"|", rest::binary>>, acc),
+    do: do_bre_pipes_to_pcre(rest, ["\\|" | acc])
+
+  defp do_bre_pipes_to_pcre(<<char::binary-size(1), rest::binary>>, acc),
+    do: do_bre_pipes_to_pcre(rest, [char | acc])
 
   defp grep_line(line, regex, flags, line_num, prefix) do
     matches = Regex.match?(regex, line)
