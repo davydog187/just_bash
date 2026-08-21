@@ -80,6 +80,11 @@ defmodule JustBash.Commands.Comm do
     parse_args(rest, %{opts | suppress1: true, suppress2: true, suppress3: true})
   end
 
+  # A bare `-` is never a flag: POSIX reads it as the stdin operand.
+  defp parse_args(["-" | rest], opts) do
+    parse_args(rest, %{opts | files: opts.files ++ ["-"]})
+  end
+
   defp parse_args(["-" <> _ = arg | _rest], _opts) do
     {:error, "comm: invalid option -- '#{arg}'\n"}
   end
@@ -95,7 +100,7 @@ defmodule JustBash.Commands.Comm do
 
     case FS.read_file(fs, resolved) do
       {:ok, content, fs} -> {:ok, content, fs}
-      {:error, _} -> {:error, "comm: #{file}: No such file or directory\n"}
+      {:error, error} -> {:error, "comm: #{file}: #{FS.strerror(error)}\n"}
     end
   end
 

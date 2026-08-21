@@ -30,6 +30,9 @@ defmodule JustBash.Commands.Od do
   defp parse_args(["-A", _ | rest], opts), do: parse_args(rest, opts)
   defp parse_args(["-t", _ | rest], opts), do: parse_args(rest, opts)
 
+  # A bare `-` is never a flag: POSIX reads it as the stdin operand.
+  defp parse_args(["-" | rest], opts), do: parse_args(rest, %{opts | file: "-"})
+
   defp parse_args(["-" <> _ = flag | _], _opts),
     do: {:error, "od: unknown option: #{flag}\n"}
 
@@ -43,7 +46,7 @@ defmodule JustBash.Commands.Od do
 
     case FS.read_file(bash.fs, resolved) do
       {:ok, c, fs} -> {:ok, c, %{bash | fs: fs}}
-      {:error, _} -> {:error, "od: #{file}: No such file or directory\n"}
+      {:error, error} -> {:error, "od: #{file}: #{FS.strerror(error)}\n"}
     end
   end
 

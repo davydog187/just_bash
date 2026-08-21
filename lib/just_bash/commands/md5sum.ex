@@ -44,6 +44,11 @@ defmodule JustBash.Commands.Md5sum do
   defp parse_args(["--binary" | rest], opts), do: parse_args(rest, opts)
   defp parse_args(["--text" | rest], opts), do: parse_args(rest, opts)
 
+  # A bare `-` is never a flag: POSIX reads it as the stdin operand.
+  defp parse_args(["-" | rest], opts) do
+    parse_args(rest, %{opts | files: opts.files ++ ["-"]})
+  end
+
   defp parse_args(["-" <> _ = arg | _rest], _opts) do
     {:error, "md5sum: invalid option '#{arg}'\n"}
   end
@@ -52,31 +57,35 @@ defmodule JustBash.Commands.Md5sum do
     parse_args(rest, %{opts | files: opts.files ++ [file]})
   end
 
+  # stdout carries the checksum lines and nothing else: `md5sum a b > sums.txt`
+  # has to produce a checksum file, not one with a diagnostic wedged into it.
   defp compute_hashes(bash, files, stdin) do
-    {output, exit_code} =
-      Enum.reduce(files, {"", 0}, fn file, {acc_out, acc_code} ->
+    {output, errors, exit_code} =
+      Enum.reduce(files, {"", "", 0}, fn file, {acc_out, acc_err, acc_code} ->
         case read_file(bash, file, stdin) do
           {:ok, content} ->
-            hash = md5(content)
-            {acc_out <> "#{hash}  #{file}\n", acc_code}
+            {acc_out <> "#{md5(content)}  #{file}\n", acc_err, acc_code}
 
-          {:error, _} ->
-            {acc_out <> "md5sum: #{file}: No such file or directory\n", 1}
+          {:error, error} ->
+            {acc_out, acc_err <> "md5sum: #{file}: #{FS.strerror(error)}\n", 1}
         end
       end)
 
-    {%{stdout: output, stderr: "", exit_code: exit_code}, bash}
+    {%{stdout: output, stderr: errors, exit_code: exit_code}, bash}
   end
 
+  # A checksum file we cannot read is a diagnostic and a non-zero exit, but it
+  # is not a checksum that did not match, so it does not feed the WARNING line.
   defp check_files(bash, files, stdin) do
-    {output, failed} =
-      Enum.reduce(files, {"", 0}, fn file, {acc_out, acc_failed} ->
+    {output, errors, failed} =
+      Enum.reduce(files, {"", "", 0}, fn file, {acc_out, acc_err, acc_failed} ->
         case read_file(bash, file, stdin) do
           {:ok, content} ->
-            check_content(bash, content, stdin, acc_out, acc_failed)
+            {out, failed} = check_content(bash, content, stdin, acc_out, acc_failed)
+            {out, acc_err, failed}
 
-          {:error, _} ->
-            {acc_out, acc_failed}
+          {:error, error} ->
+            {acc_out, acc_err <> "md5sum: #{file}: #{FS.strerror(error)}\n", acc_failed}
         end
       end)
 
@@ -88,8 +97,8 @@ defmodule JustBash.Commands.Md5sum do
         output
       end
 
-    exit_code = if failed > 0, do: 1, else: 0
-    {%{stdout: output, stderr: "", exit_code: exit_code}, bash}
+    exit_code = if failed > 0 or errors != "", do: 1, else: 0
+    {%{stdout: output, stderr: errors, exit_code: exit_code}, bash}
   end
 
   defp check_content(bash, content, stdin, acc_out, acc_failed) do
